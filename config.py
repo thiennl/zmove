@@ -16,7 +16,8 @@ class Settings:
     ssh_port: int = 22
     ssh_key: Optional[str] = None
     ssh_options: list[str] = field(default_factory=list)
-    run_as_zimbra: bool = False          # if ssh_user != zimbra: wrap with sudo -iu zimbra
+    run_as_zimbra: bool = False          # if ssh_user != zimbra_user: wrap with sudo -u zimbra -H
+    zimbra_user: str = "zimbra"          # OS user that owns /opt/zimbra
     # mailstore -> mailstore SSH (used by rsync running on source)
     node_ssh_user: str = "zimbra"
     node_ssh_port: int = 22
