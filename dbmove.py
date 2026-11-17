@@ -14,6 +14,7 @@ transaction not yet committed when W is read gets a number > W and is picked up 
 from __future__ import annotations
 
 import logging
+import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -70,7 +71,7 @@ class DbMove:
     def discover(self) -> None:
         p = self.p
         src_g = set(self.src.tables_with_column(p.src_gdb, "mailbox_id"))
-        tmpl = p.dst_gdb if self.dst.schema_exists(p.dst_gdb) else self._dst_template_group()
+        tmpl = p.dst_gdb if self._dst_group_ready() else self._dst_template_group()
         dst_g = set(self.dst.tables_with_column(tmpl, "mailbox_id"))
         missing = src_g - dst_g
         if missing:
@@ -116,29 +117,78 @@ class DbMove:
                                      f"(src={si.columns} dst={di.columns if di else None}); "
                                      "source and destination must run the same Zimbra version")
 
+    def _dst_missing_group_tables(self) -> Optional[list[str]]:
+        """Tables a populated group has but the destination group lacks.
+
+        None = the destination group schema does not exist at all."""
+        if not self.dst.schema_exists(self.p.dst_gdb):
+            return None
+        have = set(self.dst.all_tables(self.p.dst_gdb))
+        try:
+            tmpl = self._dst_template_group()
+        except SchemaMismatch:
+            return [] if "mail_item" in have else ["mail_item"]
+        return sorted(set(self.dst.all_tables(tmpl)) - have)
+
+    def _dst_group_ready(self) -> bool:
+        """The destination group schema exists AND holds every table a populated group has (an
+        empty or half-created schema left by a crash does not count)."""
+        return self._dst_missing_group_tables() == []
+
     def _dst_template_group(self) -> str:
-        r = self.dst.scalar("SELECT schema_name FROM information_schema.schemata "
-                            "WHERE schema_name LIKE 'mboxgroup%' ORDER BY schema_name LIMIT 1")
+        """A populated mboxgroup schema on the destination, never the (maybe empty) target group."""
+        r = self.dst.scalar("SELECT table_schema FROM information_schema.tables "
+                            "WHERE table_schema LIKE 'mboxgroup%' AND table_name='mail_item' "
+                            f"AND table_schema<>{q(self.p.dst_gdb)} ORDER BY table_schema LIMIT 1")
         if not r:
-            raise SchemaMismatch("destination has no mboxgroup schema to use as template")
+            raise SchemaMismatch("destination has no populated mboxgroup schema to use as template")
         return r
+
+    def estimate_bytes(self) -> int:
+        """Approximate on-disk size (data + indexes) of this mailbox's group-table rows:
+        rows of the mailbox x average bytes per row of each table on the source."""
+        p = self.p
+        names = sorted(p.group_tables)
+        if not names:
+            return 0
+        inlist = ",".join(q(t) for t in names)
+        stats = {r[0]: (int(r[1] or 0), int(r[2] or 0)) for r in self.src.query(
+            "SELECT table_name, COALESCE(data_length,0)+COALESCE(index_length,0), COALESCE(table_rows,0) "
+            f"FROM information_schema.tables WHERE table_schema={q(p.src_gdb)} AND table_name IN ({inlist})")}
+        counts = self.src.query(" UNION ALL ".join(
+            f"SELECT {q(t)}, COUNT(*) FROM {ident(p.src_gdb)}.{ident(t)} WHERE mailbox_id={int(p.src_id)}"
+            for t in names))
+        total = 0
+        for t, n in counts:
+            size, rows = stats.get(t, (0, 0))
+            total += int(n or 0) * (size // max(rows, 1))
+        return total
 
     def ensure_dst_group_db(self) -> None:
         """DbMailbox.createMailboxDatabase equivalent: clone DDL from an existing group.
 
-        Skip-check the row count so a crashed first run resumes instead of dying on CREATE.
+        SAFETY: a group schema is shared by every mailbox whose id maps to it, so an existing
+        schema is NEVER dropped or altered. Only tables that are missing are created, from a
+        `--no-data --skip-add-drop-table` dump (a plain CREATE TABLE, which fails rather than
+        replaces if mailboxd created the table meanwhile).
         """
-        if self.dst.schema_exists(self.p.dst_gdb):
-            n = self.dst.tables_with_column(self.p.dst_gdb, "mailbox_id")
-            if n:
-                return
-        else:
-            tmpl = self._dst_template_group()
+        missing = self._dst_missing_group_tables()
+        if missing == []:
+            return
+        tmpl = self._dst_template_group()
+        if missing is None:
             log.info("creating %s on %s from template %s", self.p.dst_gdb, self.dst.host.name, tmpl)
-            self.dst.execute(f"CREATE DATABASE {ident(self.p.dst_gdb)} DEFAULT CHARACTER SET utf8;")
-            ddl = (f"{self.dst.mysqldump_bin} --defaults-file=/opt/zimbra/conf/my.cnf -S \"$SOCK\" -u root "
-                   f"--no-data --skip-triggers --skip-comments {sh_ident(tmpl)}")
-            self.dst.host.run(f"{MySQL._ENV}{ddl} | {self.dst.client_cmd(self.p.dst_gdb, env=False)}")
+            self.dst.execute(f"CREATE DATABASE IF NOT EXISTS {ident(self.p.dst_gdb)} DEFAULT CHARACTER SET utf8;")
+            missing = sorted(self.dst.all_tables(tmpl))
+        else:
+            log.warning("%s on %s lacks tables %s; creating them from %s (existing tables untouched)",
+                        self.p.dst_gdb, self.dst.host.name, missing, tmpl)
+        if not missing:
+            return
+        ddl = (f"{self.dst.mysqldump_bin} --defaults-file={shlex.quote(self.dst.my_cnf)} -S \"$SOCK\" -u root "
+               f"--no-data --skip-add-drop-table --skip-triggers --skip-comments "
+               f"{sh_ident(tmpl)} {' '.join(sh_ident(t) for t in missing)}")
+        self.dst.host.run(f"{MySQL._ENV}{ddl} | {self.dst.client_cmd(self.p.dst_gdb, env=False)}")
 
     # ------------------------------------------------------------------ staging
     def create_stage(self) -> None:
@@ -208,7 +258,7 @@ class DbMove:
                    timeout=timeout)
         secs = time.monotonic() - t0
         rows = 0
-        if self._delta_tables():
+        if self._delta_tables() and not self.dry:  # dry run never created the stage
             rows = int(self.dst.scalar("SELECT " + " + ".join(
                 f"(SELECT COUNT(*) FROM {ident(self.p.stage)}.{ident(t)})"
                 for t in self._delta_tables())) or 0)
@@ -337,10 +387,21 @@ class DbMove:
 
     def live_max_change(self) -> int:
         """Used by rollback to prove the destination copy is still untouched."""
-        parts = [f"SELECT GREATEST(COALESCE(MAX(mod_metadata),0), COALESCE(MAX(mod_content),0)) AS w "
-                 f"FROM {ident(self.p.dst_gdb)}.{ident(t)} WHERE mailbox_id={self.p.dst_id}"
-                 for t in self._delta_tables()]
-        return int(self.dst.scalar(f"SELECT MAX(w) FROM ({' UNION ALL '.join(parts)}) x") or 0)
+        return self.live_state()[0]
+
+    def live_state(self) -> list[int]:
+        """[max change number, row count] over the delta tables of the destination copy.
+
+        The row count catches a hard delete of the newest item, which would bring MAX back
+        down to its value at merge time and make the copy look untouched."""
+        dts = self._delta_tables()
+        if not dts:
+            return [0, 0]
+        parts = [f"SELECT GREATEST(COALESCE(MAX(mod_metadata),0), COALESCE(MAX(mod_content),0)) AS w, "
+                 f"COUNT(*) AS n FROM {ident(self.p.dst_gdb)}.{ident(t)} WHERE mailbox_id={int(self.p.dst_id)}"
+                 for t in dts]
+        r = self.dst.query(f"SELECT COALESCE(MAX(w),0), COALESCE(SUM(n),0) FROM ({' UNION ALL '.join(parts)}) x")
+        return [int(r[0][0] or 0), int(r[0][1] or 0)] if r else [0, 0]
 
 
 def reserve_mailbox_id(dst: MySQL, explicit: Optional[int] = None) -> int:

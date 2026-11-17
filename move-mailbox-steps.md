@@ -80,10 +80,18 @@ Hàm: `Engine.new_job()` + `Engine._preflight()` / `Engine.plan()` (`engine.py`)
      `zimbraMailboxMoveSkipBlobs/HsmBlobs/SearchIndex`).
    - Blob `exclude` mà không có `shared_volumes` map → error (chỉ được exclude khi dst
      nhìn thấy cùng storage).
+   - `shared_volumes` map volume internal → bắt buộc `zimbraConfiguredServerIDForBlobDirEnabled=TRUE`
+     trên cả 2 server (không thì dir mailbox 2 server đè nhau trên storage chung); dir src == dir
+     đích → error.
+   - `db_strategy=delta` bắt buộc `verify=full` (hoặc `--force`): row đổi mà không tăng change
+     number chỉ fingerprint full mới bắt được.
    - `map_volumes()`: primary → current primary dst, secondary → current secondary dst
      (không có thì gộp vào primary), index → current index dst; check trùng
      `layout_key` (`file_bits/file_group_bits`), `store_type`, explicit override.
-   - Ước lượng dung lượng: `du` từng src dir, so với `df` dst (`need*1.1+1GB`).
+   - Ước lượng dung lượng **theo filesystem** đích: `du` từng src dir + DB của mailbox
+     (`rows × avg_row_bytes`, nhân 2 cho stage + live) trên ổ `mysql_data_directory`; gộp các
+     volume/DB nằm chung 1 ổ; trừ phần đã **giữ chỗ cho các job đang chạy** cùng controller
+     (batch song song) → thiếu là error (`need*1.1+1GB`). Không bao giờ làm đầy ổ của user khác.
    - SSH node-to-node: `ssh -p <node_port> <node_user>@<dst> true` chạy **từ src**
      (rsync chạy trên src, gọi sang dst) → hỏng key/`known_hosts` là error ngay.
    - `DbMove.discover()`: so schema group (`mboxgroup*`) + `zimbra.*` + `zimbra.mailbox`
@@ -113,8 +121,11 @@ Hàm: `Engine._reserve()` (`engine.py`). Gate hỏi:
    next_mailbox_id=next_mailbox_id+1` (row-lock serialize với mailboxd) rồi đọc id mới.
    Dry-run dùng id giả `999999`.
 4. Commit `RESERVED` (`dst_mailbox_id`, `dst_group=(id-1)%groups+1`).
-5. `DbMove.ensure_dst_group_db()`: nếu `mboxgroup<dst_group>` chưa có thì `CREATE DATABASE`
-   + clone DDL (`mysqldump --no-data`) từ 1 group mẫu trên dst.
+5. `DbMove.ensure_dst_group_db()` (chạy trong `run()` → `_ctx(prepare=True)`): nếu
+   `mboxgroup<dst_group>` chưa có, rỗng hoặc thiếu bảng so với group mẫu (crash giữa chừng) thì
+   tạo **chỉ các bảng còn thiếu** (`mysqldump --no-data --skip-add-drop-table <bảng thiếu>`) từ 1
+   group mẫu **khác** đã có `mail_item`. Schema group dùng chung với mailbox của account khác nên
+   **không bao giờ DROP/ALTER** bảng đã có; mailboxd tạo bảng song song thì `CREATE` lỗi chứ không đè.
 6. `DbMove.create_stage()`: tạo `zmove_stage_<job>`, `CREATE TABLE ... LIKE` từng bảng
    group + `zimbra.*` + `mailbox`, drop unique index để `REPLACE` delta không kẹt.
    Idempotent: resume thấy stage cũ thì chỉ tạo bảng còn thiếu.
@@ -171,12 +182,15 @@ Hàm: `Engine._lock()` (`engine.py`). Gate hỏi:
 ### Công việc
 1. **Re-check `mailHost == src` ngay trước lock** — LDAP đổi từ lúc preflight → từ chối,
    bắt chạy lại preflight (chống race).
-2. `zmprov -l ma <account> zimbraAccountStatus maintenance` (chạy trên dst, `-l` vào LDAP)
+2. Ghi cờ `locking` vào journal **trước** (crash giữa chừng thì abort/unlock vẫn biết phải trả
+   source), rồi `zmprov -l ma <account> zimbraAccountStatus maintenance` (chạy trên dst, `-l` vào LDAP)
    + `zmprov flushCache -a account <account>` (rc≠0 → log warning).
 3. SOAP `LockoutMailbox(start)` tới **src** (`LockoutMailboxRequest`, curl localhost:7071
    ngay trên src; benign `MAINTENANCE` được bỏ qua), trừ `--skip-lockout`.
 4. Commit `LOCKED` (`locked_at`, `lock_deadline = now + max_lock_seconds`, mặc định 900s).
-   Watchdog abort+unlock nếu quá hạn trước flip.
+   Watchdog abort+unlock nếu quá hạn trước flip. Từ đây mọi rsync/DB command bị cap timeout
+   bằng phần budget còn lại (`min(rsync_timeout|db_timeout, deadline-now)`), nên 1 lệnh dài
+   không giữ lock quá `max_lock_seconds`; hết budget giữa lệnh → `LockTimeout` → abort.
 
 ---
 
@@ -238,8 +252,9 @@ Hàm: `Engine._flip()` (`engine.py`). Gate hỏi:
 > `set zimbraMailHost=<dst> -- POINT OF NO RETURN`
 
 ### Công việc
-1. Rewrite transport: chỉ đổi host khi là `lmtp:host:port`; `smtp:/hold/error/VIP` hoặc
-   rỗng → giữ nguyên/giá trị mặc định + warning (không bao giờ viết bậy routing custom).
+1. Rewrite transport: chỉ đổi khi là `lmtp:host:port` → `lmtp:<dst>:<zimbraLmtpBindPort của dst>`
+   (cổng LMTP 2 server có thể khác nhau); `smtp:/hold/error/VIP` giữ nguyên + warning; rỗng →
+   `lmtp:<dst>:<port dst>`.
 2. `zmprov -l ma <account> zimbraMailHost <dst> zimbraMailTransport <transport>`.
 3. Commit `FLIPPED` (`flipped_at`, `new_transport`). Từ đây `abort` bị chặn, chỉ còn
    `rollback`/move ngược; bản src giữ nguyên để rollback/purge sau.
@@ -253,15 +268,19 @@ Hàm: `Engine._post_flip()` (`engine.py`) + `caches.py`. Gate hỏi:
 > `purge caches, restore account status, drop stage`
 
 ### Công việc
-1. `CACHES_PURGED`: `flushCache -a account`, `zmproxypurge -a` (route nginx trong
-   memcached), xóa key account-scoped `zmFldrsTags:{id}`, `zmCalsList:{id}` trên **mọi**
+1. `CACHES_PURGED`: `flushCache -a account`, `zmproxypurge -a` cho tên chuẩn **và mọi alias**
+   (route nginx trong memcached khóa theo tên login), xóa key account-scoped `zmFldrsTags:{id}`, `zmCalsList:{id}` trên **mọi**
    memcached trong `zimbraMemcachedClientServerList` (fallback `gas memcached`); bỏ qua
-   2 việc sau nếu `--skip-memcache-purge`. Lỗi từng lệnh → log warning, không fail job.
-2. `UNLOCKED`: trả `zimbraAccountStatus = orig_status` (giữ `closed/locked` gốc, không ép
-   `active`) + `flushCache`; tính `lock_seconds = now - locked_at`. **Bản src cố ý giữ
+   2 việc sau nếu `--skip-memcache-purge`. Mọi lệnh có timeout (memcached 5s, còn lại 120s); lỗi
+   → log warning, không fail job, không treo account ở maintenance.
+2. `UNLOCKED`: trả `zimbraAccountStatus = orig_status` (status ngay trước lúc lock, giữ
+   `closed/locked` gốc) **chỉ khi account vẫn đang `maintenance`** — admin đổi status trong lúc
+   move (vd. khóa account bị lộ mật khẩu) thì giữ nguyên, không mở lại; tính `lock_seconds = now - locked_at`. **Bản src cố ý giữ
    lockout maintenance** tới khi purge/rollback để JVM src không đụng bản cũ.
-3. `DONE`: `zmprov rim start` nếu bỏ index hoặc `--reindex-after`; `postqueue -f` trên
-   `mta_hosts` (fallback `gas mta`), batch nên `--no-flush-mta` rồi flush 1 lần cuối;
+3. `DONE`: `zmprov rim start` nếu bỏ index hoặc `--reindex-after`; trên `mta_hosts` (fallback
+   `gas mta`) `postqueue -j` rồi `postqueue -i <id>` **chỉ cho message deferred gửi tới account/alias
+   này** — không bao giờ `postqueue -f` (đẩy lại cả queue của mọi user); Postfix < 3.1 → warning,
+   mail tự retry theo lịch;
    drop stage (trừ `--keep-stage`); `status=done` (+ cờ `dry_run` nếu dry-run); ghi metrics
    Prometheus textfile (nếu đặt) + prune event > 30 ngày.
 
@@ -271,7 +290,8 @@ Hàm: `Engine._post_flip()` (`engine.py`) + `caches.py`. Gate hỏi:
 
 Hàm: `Engine.purge()` — `zmove purge ACCOUNT --server <src>` (`cli.py`, `engine.py`).
 
-1. Chỉ purge job `phase DONE`, từ chối job `dry_run`, từ chối khi `mailHost` đã quay về src.
+1. Chỉ purge job `phase DONE` **và** `status=done` (job đã rollback bị loại), từ chối job
+   `dry_run`, từ chối khi `mailHost` đã quay về src hoặc account còn 1 move mới hơn chưa xong.
 2. Verify đúng `src_mailbox_id` còn trên src (sai → nghi đã purge, dừng).
 3. `DELETE` DB src (group + `zimbra.*` allowlist + `zimbra.mailbox`) trong 1 txn; `rm -rf
    --one-file-system` từng blob/index dir src (trừ `--keep-blobs`; shared storage thì chỉ
@@ -285,14 +305,28 @@ Hàm: `Engine.purge()` — `zmove purge ACCOUNT --server <src>` (`cli.py`, `engi
 | Tình huống | Hành vi |
 |---|---|
 | Decline tại gate | `StepDeclined`: `aborted` nếu `< RESERVED`, `failed` nếu sau; log `PAUSED` + nhắc `resume/abort`; đang giữ lock thì warn rõ `still LOCKED` |
-| `resume <job>` | Chạy tiếp từ phase đã commit; resume khi locked → re-`lockout(start)` (lockout nằm trong RAM JVM, restart là mất) + cấp lại watchdog + hạ `>LOCKED` về `LOCKED` để sync/verify lại từ đầu |
+| `resume <job>` | Chạy tiếp từ phase đã commit. Từ chối job đã rollback/purge/done, job `aborted` sau `FLIPPED`, và job đang được process khác chạy (owner còn sống hoặc heartbeat < 120s; heartbeat thread beat mỗi 30s) trừ `--force`. Resume khi locked → `_relock`: check lại `mailHost`, set lại `maintenance`, re-`lockout(start)`, cấp lại watchdog, hạ `>LOCKED` về `LOCKED` để sync/verify lại từ đầu (có lấy semaphore cutover của batch) |
 | `resume --yes` | Tắt `confirm_steps` cho lần chạy đó |
-| `abort` (chỉ `< FLIPPED`) | Verify chủ rồi xóa live dst + drop stage + xóa blob dirs dst + `lockout(end)` src + trả `orig_status`; từ `MERGED` trở đi hạ về `RESERVED`, xóa `merged_max_change` để resume copy lại |
-| `rollback` (sau `FLIPPED`, trước `PURGED`) | Từ chối job dry-run; maintenance dst, so `live_max_change == merged_max_change` (lệch → bắt `--force` hoặc move ngược); trả `mailHost/Transport` về src, purge route + memcached, `lockout(end)` src, trả status, xóa live dst + blob dirs; ghi `rolled_back_at` (move lại sang dst phải restart mailboxd dst trước) |
-| `unlock ACCOUNT -s <server>` | Khôi phục sự cố kẹt lock: trả `orig_status` (không ép `active`), `flushCache`, `lockout(end)` trên `mailHost` hiện tại, đánh job active `< FLIPPED` thành `aborted` |
-| `gc` | Dọn stage + blob dirs của job `aborted`/`failed` quá `--older-than` (mặc định 24h); bỏ qua `≥ FLIPPED` và `failed` đang locked |
+| `abort` (chỉ `< FLIPPED`) | Xóa live dst + blob dirs dst + stage — **trừ khi** id đích đã thuộc job khác hoặc account đang home ở dst. **Luôn** `lockout(end)` + trả `orig_status` nếu job từng lock (kể cả khi không dựng được context vì dst sập). Không trả được source → job giữ `failed` + cờ `locking`, báo lỗi. Thành công → `aborted`, phase hạ về `RESERVED`, xóa `watermark/lock_deadline/merged_*` để resume copy lại từ online phase |
+| `rollback` (sau `FLIPPED`, trước `PURGED`) | Từ chối job dry-run/đã rollback; maintenance dst, so `[max change, số row]` live với lúc merge (lệch → bắt `--force` hoặc move ngược); trả `mailHost/Transport` về src (transport rỗng → xóa attr), purge route + memcached, `lockout(end)` src, trả status, xóa live dst + blob dirs; ghi `rolled_back_at` (move lại sang dst phải restart mailboxd dst trước) |
+| `unlock ACCOUNT -s <server>` | Khôi phục sự cố kẹt lock: job active `< FLIPPED` → `abort` đầy đủ (dọn cả bản đã merge); rồi trả `orig_status` của job gần nhất (không ép `active`, kể cả sau flip), `flushCache`, `lockout(end)` trên `mailHost` hiện tại |
+| `gc` | Job `failed` (chưa lock) → `abort`; job `aborted` → dọn stage + blob dirs đích (chỉ khi id đích không còn được dùng và không thuộc job khác), đánh dấu `gc_at` để lần sau bỏ qua; bỏ qua `≥ FLIPPED` và `failed` đang locked |
 
-## 12. Tham chiếu nhanh
+## 12. Phạm vi ảnh hưởng (account khác)
+
+| Thao tác | Chạm vào | Bảo vệ |
+|---|---|---|
+| `zmprov ma`, `flushCache`, `zmproxypurge`, memcached delete, `LockoutMailbox`, `rim` | Chỉ account đang move (tên chuẩn lấy từ LDAP, alias của chính nó) | Mọi tham số shell-quote |
+| Queue MTA | Chỉ message deferred gửi tới account/alias đó | Không dùng `postqueue -f` |
+| `current_volumes.next_mailbox_id` | Row dùng chung, khóa trong 1 txn ngắn | Id mới không trùng mailbox nào |
+| Group schema `mboxgroupN` đích | Dùng chung với mailbox khác | Chỉ `CREATE` bảng thiếu, không DROP/ALTER; merge chỉ `INSERT` với `mailbox_id=<dst_id>` trong 1 txn; merge không bị kill giữa chừng |
+| `DELETE` mailbox (overwrite/abort/rollback/purge) | `WHERE mailbox_id=<id>` | Luôn kiểm `account_id` chủ; overwrite dùng `group_id` thật; abort/gc bỏ qua id đã thuộc job khác hoặc account đang home ở đó |
+| Blob/index dir | `<root>/[serverId/]<bucket>/<id>` của mailbox đó | Regex path, `--one-file-system`; shared storage bắt buộc serverId prefix; gc không xóa dir của id đang dùng |
+| Stage `zmove_stage_<job>` | Schema riêng của job | Tên có id job, `ident()` |
+| Dung lượng ổ | Ổ blob/index/MySQL đích dùng chung | Preflight theo filesystem + giữ chỗ cho job song song |
+| Tải I/O / MySQL | Toàn server (hiệu năng) | rsync online `ionice/nice` **cả 2 đầu** + `--bwlimit`; `--single-transaction` không khóa bảng; giới hạn `--per-server`, `--max-cutovers`. Mailbox rất lớn: prestage giữ snapshot lâu (history list InnoDB tăng) và merge là 1 txn lớn → chạy ngoài giờ cao điểm |
+
+## 13. Tham chiếu nhanh
 
 - State machine: `Engine.run()` — `engine.py:run/_preflight/_reserve/_online_phase/_lock/
   _locked_phase/_flip/_post_flip/abort/rollback/purge/unlock`

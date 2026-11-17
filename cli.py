@@ -21,7 +21,8 @@ from . import __version__
 from .batch import Batch, read_plan
 from .config import load
 from .engine import Engine, MoveError
-from .state import Phase, State
+from .state import Job, Phase, State
+from .topology import account_info
 
 log = logging.getLogger("zmove")
 
@@ -83,7 +84,7 @@ def _add_move_args(p: argparse.ArgumentParser) -> None:
     x.add_argument("--exclude-tables", help="comma list of mboxgroup tables to skip (e.g. event)")
     x.add_argument("--reindex-after", action="store_true", help="re-index on destination after move")
     x.add_argument("--no-flush-mta", action="store_true",
-                   help="skip postqueue -f on MTAs (flush once manually after a batch)")
+                   help="do not reschedule this account's deferred mail on the MTAs")
     x.add_argument("--background", action="store_true", help="detach and run asynchronously")
     x.add_argument("--force", action="store_true", help="override stale-cache safety check")
     x.add_argument("--keep-stage", action="store_true", help="keep staging schema for forensics")
@@ -106,9 +107,9 @@ def _print_job(j, as_json: bool = False) -> None:
           f" lock={lock if lock is not None else '-'}s hb={hb}s" + (f"\n    error: {j.error}" if j.error else ""))
 
 
-def _background(argv: list[str]) -> int:
+def _background(argv: list[str], log_dir: str) -> int:
     argv = [a for a in argv if a != "--background"]
-    logf = os.path.expanduser("~/.local/share/zmove/logs/background.log")
+    logf = os.path.join(log_dir, "background.log")
     os.makedirs(os.path.dirname(logf), exist_ok=True)
     with open(logf, "a") as f:
         p = subprocess.Popen([sys.executable, "-m", "zmove", *argv, "--yes"], stdout=f, stderr=f,
@@ -186,17 +187,17 @@ def main(argv=None) -> int:
                    help="also drop event rows older than DAYS from finished jobs")
 
     a = ap.parse_args(argv)
-    if getattr(a, "background", False):
-        if getattr(a, "confirm_steps", False):
-            print("error: --confirm-steps needs an interactive terminal; drop --background",
-                  file=sys.stderr)
-            return 2
-        return _background(argv)
     try:
         s = load(a.config)
     except (ValueError, FileNotFoundError) as e:
         print(f"error: bad config: {e}", file=sys.stderr)
         return 2
+    if getattr(a, "background", False):
+        if getattr(a, "confirm_steps", False):
+            print("error: --confirm-steps needs an interactive terminal; drop --background",
+                  file=sys.stderr)
+            return 2
+        return _background(argv, s.log_dir)
     _setup_logging(s, a.verbose)
     st = State(s.state_db)
     eng = Engine(s, st, dry_run=a.dry_run, progress=lambda m: print(m, flush=True))
@@ -204,7 +205,6 @@ def main(argv=None) -> int:
     try:
         if a.cmd == "preflight":
             acct = account_info(eng.host(a.dst), a.account)
-            from .state import Job
             tmp = Job(id="preflight", account=acct.name, account_id=acct.id, src=a.src, dst=a.dst,
                       options={k: v for k, v in _move_opts(a).items() if v is not None})
             rep = eng.plan(tmp)
@@ -272,6 +272,10 @@ def main(argv=None) -> int:
             if job.status == "done":
                 print("already done")
                 return 0
+            if job.status == "aborted" and not a.yes and sys.stdin.isatty():
+                if input(f"job {job.id} was aborted; its copies were removed and it will restart "
+                         f"from {Phase.RESERVED.name}. proceed? [y/N] ").strip().lower() != "y":
+                    return 1
             if a.force:
                 job.options["force"] = True
             if a.yes:
@@ -293,7 +297,9 @@ def main(argv=None) -> int:
                 jobs = [st.get(a.job)]
             else:
                 jobs = [j for j in st.find(account=a.account, server=a.server)
-                        if j.phase == Phase.DONE and (not a.server or j.src == a.server)]
+                        if j.phase == Phase.DONE and j.status == "done"
+                        and not j.data.get("rolled_back_at")
+                        and (not a.server or j.src == a.server)]
                 if not a.all and not a.account:
                     print("give ACCOUNT, --job or --all")
                     return 2
@@ -304,7 +310,7 @@ def main(argv=None) -> int:
                 return 0
             for j in jobs:
                 print(f"will purge mailbox {j.data.get('src_mailbox_id')} of {j.account} on {j.src}")
-            if not a.yes and input("proceed? [y/N] ").lower() != "y":
+            if not a.yes and (not sys.stdin.isatty() or input("proceed? [y/N] ").lower() != "y"):
                 return 1
             for j in jobs:
                 eng.purge(j, keep_blobs=a.keep_blobs)
@@ -321,28 +327,18 @@ def main(argv=None) -> int:
                 n = st.prune_events(max_age_days=a.prune_events)
                 print(f"pruned {n} old event rows")
             cleaned = 0
-            for j in st.find(status="aborted") + st.find(status="failed"):
-                if j.updated > cutoff or j.phase >= Phase.FLIPPED:
+            for j in st.find(status="aborted", limit=10000) + st.find(status="failed", limit=10000):
+                if j.updated > cutoff or j.phase >= Phase.FLIPPED or j.data.get("gc_at"):
                     continue
-                if j.status == "failed" and Phase.LOCKED <= j.phase:
+                if j.status == "failed" and (Phase.LOCKED <= j.phase or j.data.get("locking")):
                     print(f"skip {j.id}: failed while locked, resolve with resume/abort")
                     continue
-                stage = f"zmove_stage_{j.id}"
-                eng.mysql(j.dst).execute(f"DROP DATABASE IF EXISTS `{stage}`;")
-                # blob dirs landed directly under the new mailbox id: same cleanup as abort
                 try:
-                    dbm, plans, _bs = eng._ctx(j) if j.phase >= Phase.RESERVED else (None, [], None)
-                    if plans and not a.dry_run:
-                        from .blobs import BlobSync
-                        BlobSync(s, eng.host(j.dst), eng.host(j.dst)).remove_dirs(
-                            eng.host(j.dst), [p.dst_dir for p in plans if not p.external])
-                    if dbm and dbm.dst.schema_exists(stage):
-                        dbm.drop_stage()
+                    what = eng.gc_job(j)
                 except Exception as e:  # noqa: BLE001 best-effort; journal keeps the job
-                    print(f"  {j.id}: blob cleanup skipped ({e})")
-                if j.status == "failed":
-                    eng.abort(j, reason="gc")
-                print(f"cleaned {j.id}")
+                    print(f"  {j.id}: cleanup failed ({type(e).__name__}: {e})")
+                    continue
+                print(f"{what} {j.id}")
                 cleaned += 1
             if not cleaned and not a.prune_events:
                 print("nothing to clean")

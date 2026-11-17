@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -102,15 +103,25 @@ def pipe(src: Host, src_cmd: str, dst: Host, dst_cmd: str, *,
                           stderr=subprocess.PIPE)
     p2 = subprocess.Popen(dst.ssh_argv() + [dst.wrap(dst_cmd)], stdin=p1.stdout,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert p1.stdout is not None
+    assert p1.stdout is not None and p1.stderr is not None
     p1.stdout.close()  # let p1 get SIGPIPE if p2 dies
+    # drain the producer's stderr concurrently: a chatty mysqldump must not fill the pipe
+    # buffer and block while we wait on the consumer
+    e1_buf: list[bytes] = []
+    drain = threading.Thread(target=lambda: e1_buf.append(p1.stderr.read()), daemon=True)
+    drain.start()
     try:
         _, e2 = p2.communicate(timeout=timeout)
-        _, e1 = p1.communicate(timeout=60)
+        p1.wait(timeout=60)
     except subprocess.TimeoutExpired:
-        p1.kill()
-        p2.kill()
+        for p in (p1, p2):
+            p.kill()
+        for p in (p1, p2):
+            p.wait()            # reap: no zombie ssh processes
         raise
+    finally:
+        drain.join(timeout=5)
+    e1 = b"".join(e1_buf)
     if p1.returncode != 0:
         raise RemoteError(src.name, src_cmd, p1.returncode, e1.decode(errors="replace"))
     if p2.returncode != 0:
