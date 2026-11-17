@@ -57,10 +57,18 @@ class Host:
         return argv
 
     def wrap(self, cmd: str) -> str:
-        """Run as zimbra with a login shell (PATH includes /opt/zimbra/bin)."""
+        """Run as the zimbra user with a login shell (PATH includes /opt/zimbra/bin).
+
+        When SSH logs in as another user (e.g. root) the command goes through
+        `sudo -n -u zimbra -H bash -lc '<cmd>'`. NOT `sudo -i`: sudo -i re-joins the argv for
+        the target's login shell without escaping `$`, so `$(...)`, `$SOCK` or awk's `$1`
+        would be expanded too early (to empty strings). `bash -l` still loads zimbra's
+        profile, and `cd ~` leaves a cwd (e.g. /root) zimbra cannot read."""
         inner = f"set -o pipefail; {cmd}"
-        if self.s.run_as_zimbra and self.s.ssh_user != "zimbra":
-            return f"sudo -n -iu zimbra bash -lc {shlex.quote(inner)}"
+        if self.s.run_as_zimbra and self.s.ssh_user != self.s.zimbra_user:
+            inner = f"cd ~ 2>/dev/null; {inner}"
+            return (f"sudo -n -u {shlex.quote(self.s.zimbra_user)} -H "
+                    f"bash -lc {shlex.quote(inner)}")
         return f"bash -lc {shlex.quote(inner)}"
 
     def run(self, cmd: str, *, input: Optional[str] = None, check: bool = True,

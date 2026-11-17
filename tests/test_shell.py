@@ -75,3 +75,34 @@ def test_pipe_timeout_reaps():
     src, dst = PipeHost("s", s), PipeHost("d", s)
     with pytest.raises(subprocess.TimeoutExpired):
         remote.pipe(src, "sleep 30", dst, "cat >/dev/null", timeout=0.5)
+
+
+def _sudo_ok(user):
+    import shutil
+    return shutil.which("sudo") and subprocess.run(
+        ["sudo", "-n", "-u", user, "true"], capture_output=True).returncode == 0
+
+
+def test_sudo_wrap_keeps_dollar_quotes_stdin_and_errors():
+    """ssh_user=root + run_as_zimbra: the wrapped command must reach the target shell intact."""
+    import getpass
+    user = getpass.getuser()          # sudo to ourselves: same code path, no extra account
+    if not _sudo_ok(user):
+        pytest.skip("passwordless sudo not available")
+    s = Settings(ssh_user="someone-else", run_as_zimbra=True, zimbra_user=user)
+    h = Host("x", s)
+    cmd = ("export MYSQL_PWD=\"$(printf %s \"s3cr'et\")\"; SOCK=\"$(echo /tmp/my.sock)\"; "
+           "echo \"sock=$SOCK pwd=$MYSQL_PWD\"; tr a-z A-Z | awk '{print \"in:\" $1}'; "
+           "printf '%s\\n' 'o'\"'\"'brien@x'")
+    w = h.wrap(cmd)
+    assert w.startswith(f"sudo -n -u {user} -H bash -lc ") and " -i" not in w.split("bash")[0]
+    p = subprocess.run(["bash", "-c", w], input="hello stdin\n", capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.splitlines() == ["sock=/tmp/my.sock pwd=s3cr'et", "in:HELLO", "o'brien@x"]
+    p = subprocess.run(["bash", "-c", h.wrap("false | tr a b")], capture_output=True, text=True)
+    assert p.returncode != 0          # pipefail survives the sudo hop
+
+
+def test_wrap_direct_zimbra_user_has_no_sudo():
+    h = Host("x", Settings(ssh_user="zimbra", run_as_zimbra=True))
+    assert h.wrap("true").startswith("bash -lc ")
