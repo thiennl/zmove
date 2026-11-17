@@ -20,9 +20,12 @@ def env(tmp_path, monkeypatch):
     eng._hosts.update(hosts)
     lockouts = []
     monkeypatch.setattr(eng, "_lockout", lambda server, acct, op: lockouts.append((server, op)))
-    home = {"h": "src"}
+    home = {"h": "src", "status": "maintenance"}
     monkeypatch.setattr(E, "account_info",
-                        lambda h, a: AccountInfo(a, "id1", home["h"], "lmtp:src:7025", "active"))
+                        lambda h, a: AccountInfo(a, "id1", home["h"], "lmtp:src:7025", home["status"]))
+    from zmove.topology import ServerInfo
+    for n in ("src", "dst"):
+        eng._servers[n] = ServerInfo(n, "", "", "", "", 100, False, False, False, False, lmtp_port=7026)
     job = st.create("o'brien@x", "id1", "src", "dst", dict(E.DEFAULT_OPTIONS))
     job.data.update(orig_status="closed", orig_transport="lmtp:src:7025",
                     copy={"search_index": True}, dst_mailbox_id=42)
@@ -34,7 +37,8 @@ def test_flip_and_post_flip_complete(env):
     job.phase = Phase.MERGED
     eng._flip(job)
     assert job.phase == Phase.FLIPPED
-    assert any("zimbraMailHost dst zimbraMailTransport lmtp:dst:7025" in c for c in hosts["dst"].cmds)
+    # destination LMTP port, not the source's
+    assert any("zimbraMailHost dst zimbraMailTransport lmtp:dst:7026" in c for c in hosts["dst"].cmds)
     assert any("'o'\"'\"'brien@x'" in c for c in hosts["dst"].cmds)       # quoted account
     dbm = FakeDbm()
     eng._post_flip(job, dbm)
@@ -131,6 +135,8 @@ class FakeMySQL:
     def tables_with_column(self, s, c):
         return sorted(self.schemas.get(s, ()))
 
+    all_tables = lambda self, s: sorted(self.schemas.get(s, ()))  # noqa: E731
+
     def scalar(self, sql, **kw):
         cands = sorted(k for k, v in self.schemas.items()
                        if k.startswith("mboxgroup") and "mail_item" in v and f"'{k}'" not in sql)
@@ -154,10 +160,14 @@ def test_ensure_group_fills_empty_schema():
     assert any("mysqldump" in c and "mboxgroup1" in c for c in dst.host.cmds)
 
 
-def test_ensure_group_fills_half_imported_schema():
+def test_ensure_group_fills_half_imported_schema_without_dropping():
     dst = FakeMySQL({"mboxgroup1": {"mail_item", "tombstone"}, "mboxgroup7": {"mail_item"}})
     _dbm(dst).ensure_dst_group_db()
-    assert dst.host.cmds
+    (cmd,) = dst.host.cmds
+    # other mailboxes live in mboxgroup7: only the missing table is created, nothing dropped
+    assert "--skip-add-drop-table" in cmd and "mboxgroup1 tombstone" in cmd
+    assert "mail_item" not in cmd.split("mboxgroup1", 1)[1].split("|")[0]
+    assert not any("DROP" in e or "CREATE DATABASE" in e for e in dst.executed)
 
 
 def test_ensure_group_ready_is_noop():
@@ -198,3 +208,59 @@ def test_relock_resets_to_locked(env):
     assert job.phase == Phase.LOCKED and ("src", "start") in lockouts
     assert job.data["lock_deadline"] > time.time()
     assert any("zimbraAccountStatus maintenance" in c for c in hosts["dst"].cmds)
+
+
+def test_restore_status_respects_admin_change(env):
+    eng, st, hosts, _, home, job = env
+    home["status"] = "locked"          # admin locked the account during the move
+    assert eng._restore_status(hosts["dst"], job, "active") is False
+    assert not any("zimbraAccountStatus" in c for c in hosts["dst"].cmds)
+    home["status"] = "maintenance"
+    assert eng._restore_status(hosts["dst"], job, "active") is True
+
+
+def test_unlock_leaves_non_maintenance_status(env):
+    eng, st, hosts, lockouts, home, job = env
+    job.status = "aborted"
+    st.save(job)
+    home["status"] = "closed"
+    eng.unlock("o'brien@x", "dst")
+    assert not any("zimbraAccountStatus" in c for c in hosts["dst"].cmds)
+
+
+def test_disk_reservations_are_shared_between_jobs():
+    key = ("dst", "/opt")
+    E._reserve_space("a", {key: 100})
+    E._reserve_space("b", {key: 50})
+    try:
+        assert E._reserved_by_others(key, "a") == 50
+        assert E._reserved_by_others(key, "c") == 150
+    finally:
+        E._release_space("a")
+        E._release_space("b")
+    assert E._reserved_by_others(key, "c") == 0
+
+
+def test_lock_captures_current_status(env, monkeypatch):
+    eng, st, hosts, lockouts, home, job = env
+    job.phase = Phase.PRESTAGED
+    home["status"] = "locked"
+    monkeypatch.setattr(E.caches, "flush_account_cache", lambda h, a: None)
+    eng._lock(job)
+    assert job.data["orig_status"] == "locked" and job.phase == Phase.LOCKED
+
+
+def test_preflight_reservation_roundtrip(env, monkeypatch):
+    import json
+    eng, st, hosts, _, _, job = env
+    rep = {"errors": [], "warnings": [], "reserve": {"dst:/opt/zimbra": 123},
+           "src_mailbox": {"id": 1, "group_id": 1, "index_volume_id": 2, "items": 0, "size": 0},
+           "account": {"status": "active", "mail_transport": "", "aliases": []},
+           "volume_map": {1: 1}, "copy": {}, "dst_mailbox": None}
+    json.dumps(rep)                                   # printable by `zmove preflight`
+    monkeypatch.setattr(eng, "plan", lambda j: rep)
+    eng._preflight(job)
+    try:
+        assert E._reserved_by_others(("dst", "/opt/zimbra"), "other") == 123
+    finally:
+        E._release_space(job.id)

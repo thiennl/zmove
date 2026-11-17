@@ -84,7 +84,7 @@ def _add_move_args(p: argparse.ArgumentParser) -> None:
     x.add_argument("--exclude-tables", help="comma list of mboxgroup tables to skip (e.g. event)")
     x.add_argument("--reindex-after", action="store_true", help="re-index on destination after move")
     x.add_argument("--no-flush-mta", action="store_true",
-                   help="skip postqueue -f on MTAs (flush once manually after a batch)")
+                   help="do not reschedule this account's deferred mail on the MTAs")
     x.add_argument("--background", action="store_true", help="detach and run asynchronously")
     x.add_argument("--force", action="store_true", help="override stale-cache safety check")
     x.add_argument("--keep-stage", action="store_true", help="keep staging schema for forensics")

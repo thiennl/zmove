@@ -110,6 +110,11 @@ class MySQL:
                           f"table_schema={q(schema)} AND column_name={q(column)} ORDER BY table_name")
         return [r[0] for r in rows]
 
+    def all_tables(self, schema: str) -> list[str]:
+        rows = self.query(f"SELECT table_name FROM information_schema.tables WHERE "
+                          f"table_schema={q(schema)} AND table_type='BASE TABLE' ORDER BY table_name")
+        return [r[0] for r in rows]
+
     def table_info(self, schema: str, tables: Iterable[str]) -> dict[str, TableInfo]:
         tl = list(tables)
         if not tl:

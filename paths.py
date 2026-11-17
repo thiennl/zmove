@@ -125,20 +125,17 @@ def locator_case_sql(column: str, mapping: dict[int, int]) -> str:
     return f"(CASE {column} {whens} ELSE {column} END)"
 
 
-def replace_host_in_transport(transport: str, new_host: str) -> str:
-    """'lmtp:mbx01.dom:7025' -> 'lmtp:mbx02.dom:7025'.
+def replace_host_in_transport(transport: str, new_host: str, port: int = 7025) -> str:
+    """'lmtp:mbx01.dom:7025' -> 'lmtp:mbx02.dom:<port>'.
 
-    Only LMTP transports point at a mailbox server. Anything else (smtp relay, hold,
-    error, VIP) is returned unchanged so a move never rewrites custom routing.
+    ``port`` is the destination's zimbraLmtpBindPort: the source's LMTP port is not
+    necessarily the destination's. Only LMTP transports point at a mailbox server. Anything
+    else (smtp relay, hold, error, VIP) is returned unchanged so a move never rewrites
+    custom routing.
     """
     if not transport:
-        return f"lmtp:{new_host}:7025"
+        return f"lmtp:{new_host}:{int(port)}"
     parts = transport.split(":")
     if parts[0].lower() != "lmtp":
         return transport
-    if len(parts) >= 3:
-        parts[1] = new_host
-        return ":".join(parts)
-    if len(parts) == 2:
-        return f"{parts[0]}:{new_host}"
-    return f"lmtp:{new_host}:7025"
+    return f"{parts[0]}:{new_host}:{int(port)}"

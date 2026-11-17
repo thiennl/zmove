@@ -84,7 +84,9 @@ class BlobSync:
                    f"{link} {srcs_q} {dq}")
             return self.dst, cmd
         e = f"ssh -p {self.s.node_ssh_port} {self.s.node_ssh_options}"
-        rpath = f"mkdir -p {shlex.quote(plan.dst_dir)} && {self.s.rsync_bin}"
+        # the receiver writes on the destination, where other users' mailboxes live: throttle
+        # it too during online passes, not only the sender
+        rpath = f"mkdir -p {shlex.quote(plan.dst_dir)} && {nice}{self.s.rsync_bin}"
         cmd = (f"{nice}{self.s.rsync_bin} {' '.join(opts)} -e {shlex.quote(e)} "
                f"--rsync-path={shlex.quote(rpath)} {srcs_q} "
                f"{shlex.quote(self.s.node_ssh_user + '@' + self.dst.name)}:{dq}")
@@ -145,8 +147,16 @@ class BlobSync:
         return self.inventory(host, dirs)[1]
 
     def free_bytes(self, host: Host, path: str) -> Optional[int]:
-        out = host.out(f"df -PB1 {shlex.quote(path)} | awk 'NR==2 {{print $4}}'")
-        return int(out) if out.isdigit() else None
+        info = self.fs_free(host, path)
+        return info[1] if info else None
+
+    def fs_free(self, host: Host, path: str) -> Optional[tuple[str, int]]:
+        """(mount point, free bytes) of the filesystem holding `path`."""
+        out = host.out(f"df -PB1 {shlex.quote(path)} | awk 'NR==2 {{print $6\" \"$4}}'")
+        parts = out.rsplit(" ", 1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            return None
+        return parts[0], int(parts[1])
 
     def remove_dirs(self, host: Host, dirs: list[str]) -> None:
         for d in dirs:

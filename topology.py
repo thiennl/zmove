@@ -46,6 +46,7 @@ class ServerInfo:
     move_skip_blobs: bool
     move_skip_hsm_blobs: bool
     move_skip_index: bool
+    lmtp_port: int = 7025
     volumes: list[Volume] = field(default_factory=list)
     current_msg: int = 0
     current_secondary: Optional[int] = None
@@ -71,6 +72,7 @@ class AccountInfo:
     mail_host: str
     mail_transport: str
     status: str
+    aliases: list[str] = field(default_factory=list)   # zimbraMailAlias + mail + delivery addr
 
 
 @dataclass
@@ -85,7 +87,8 @@ class MailboxRow:
 def server_info(host: Host, mysql: MySQL) -> ServerInfo:
     attrs = parse_zmprov_attrs(host.out(
         f"zmprov -l gs {shlex.quote(host.name)} zimbraId zimbraConfiguredServerIDForBlobDirEnabled "
-        "zimbraMailboxMoveSkipBlobs zimbraMailboxMoveSkipHsmBlobs zimbraMailboxMoveSkipSearchIndex"))
+        "zimbraMailboxMoveSkipBlobs zimbraMailboxMoveSkipHsmBlobs zimbraMailboxMoveSkipSearchIndex "
+        "zimbraLmtpBindPort"))
     version = host.out("zmcontrol -v").splitlines()[0].strip()
     groups = int(host.out("zmlocalconfig -m nokey zimbra_mailbox_groups") or 100)
     started = host.out("pid=$(pgrep -u zimbra -f 'java.*mailboxd' | head -1); "
@@ -101,6 +104,7 @@ def server_info(host: Host, mysql: MySQL) -> ServerInfo:
         move_skip_blobs=tf(first(attrs, "zimbraMailboxMoveSkipBlobs")),
         move_skip_hsm_blobs=tf(first(attrs, "zimbraMailboxMoveSkipHsmBlobs")),
         move_skip_index=tf(first(attrs, "zimbraMailboxMoveSkipSearchIndex")),
+        lmtp_port=int(first(attrs, "zimbraLmtpBindPort", "7025") or 7025),
         mailboxd_started=int(started) if started.isdigit() else None,
     )
     has_store_type = mysql.scalar(
@@ -121,14 +125,24 @@ def server_info(host: Host, mysql: MySQL) -> ServerInfo:
 
 
 def account_info(host: Host, account: str) -> AccountInfo:
-    attrs = parse_zmprov_attrs(host.out(
-        f"zmprov -l ga {shlex.quote(account)} zimbraId zimbraMailHost zimbraMailTransport zimbraAccountStatus mail"))
+    """Look up an account. The returned name is the CANONICAL one (zmprov's '# name' header),
+    even when an alias was given, so every later per-account command targets the real account."""
+    text = host.out(f"zmprov -l ga {shlex.quote(account)} zimbraId zimbraMailHost zimbraMailTransport "
+                    "zimbraAccountStatus mail zimbraMailAlias zimbraMailDeliveryAddress")
+    attrs = parse_zmprov_attrs(text)
     if not first(attrs, "zimbraId"):
         raise LookupError(f"account {account} not found")
-    return AccountInfo(name=account, id=first(attrs, "zimbraId", ""),
+    name = account
+    for line in text.splitlines():
+        if line.startswith("# name "):
+            name = line[len("# name "):].strip() or account
+            break
+    aliases = sorted({a.strip().lower() for k in ("mail", "zimbraMailAlias", "zimbraMailDeliveryAddress")
+                      for a in attrs.get(k, []) if a.strip()} - {name.lower()})
+    return AccountInfo(name=name, id=first(attrs, "zimbraId", ""),
                        mail_host=first(attrs, "zimbraMailHost", ""),
                        mail_transport=first(attrs, "zimbraMailTransport", ""),
-                       status=first(attrs, "zimbraAccountStatus", "active"))
+                       status=first(attrs, "zimbraAccountStatus", "active"), aliases=aliases)
 
 
 def mailbox_row(mysql: MySQL, account_id: str, with_stats: bool = True) -> Optional[MailboxRow]:

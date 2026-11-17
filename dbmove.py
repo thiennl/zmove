@@ -117,20 +117,23 @@ class DbMove:
                                      f"(src={si.columns} dst={di.columns if di else None}); "
                                      "source and destination must run the same Zimbra version")
 
-    def _dst_group_ready(self) -> bool:
-        """The destination group schema exists AND holds every mailbox table a populated group
-        has (an empty or half-imported schema left by a crash between CREATE DATABASE and the
-        end of the DDL import does not count)."""
+    def _dst_missing_group_tables(self) -> Optional[list[str]]:
+        """Tables a populated group has but the destination group lacks.
+
+        None = the destination group schema does not exist at all."""
         if not self.dst.schema_exists(self.p.dst_gdb):
-            return False
-        have = set(self.dst.tables_with_column(self.p.dst_gdb, "mailbox_id"))
-        if not have:
-            return False
+            return None
+        have = set(self.dst.all_tables(self.p.dst_gdb))
         try:
             tmpl = self._dst_template_group()
         except SchemaMismatch:
-            return "mail_item" in have      # the only group on the server
-        return set(self.dst.tables_with_column(tmpl, "mailbox_id")) <= have
+            return [] if "mail_item" in have else ["mail_item"]
+        return sorted(set(self.dst.all_tables(tmpl)) - have)
+
+    def _dst_group_ready(self) -> bool:
+        """The destination group schema exists AND holds every table a populated group has (an
+        empty or half-created schema left by a crash does not count)."""
+        return self._dst_missing_group_tables() == []
 
     def _dst_template_group(self) -> str:
         """A populated mboxgroup schema on the destination, never the (maybe empty) target group."""
@@ -141,21 +144,50 @@ class DbMove:
             raise SchemaMismatch("destination has no populated mboxgroup schema to use as template")
         return r
 
+    def estimate_bytes(self) -> int:
+        """Approximate on-disk size (data + indexes) of this mailbox's group-table rows:
+        rows of the mailbox x average bytes per row of each table on the source."""
+        p = self.p
+        names = sorted(p.group_tables)
+        if not names:
+            return 0
+        inlist = ",".join(q(t) for t in names)
+        stats = {r[0]: (int(r[1] or 0), int(r[2] or 0)) for r in self.src.query(
+            "SELECT table_name, COALESCE(data_length,0)+COALESCE(index_length,0), COALESCE(table_rows,0) "
+            f"FROM information_schema.tables WHERE table_schema={q(p.src_gdb)} AND table_name IN ({inlist})")}
+        counts = self.src.query(" UNION ALL ".join(
+            f"SELECT {q(t)}, COUNT(*) FROM {ident(p.src_gdb)}.{ident(t)} WHERE mailbox_id={int(p.src_id)}"
+            for t in names))
+        total = 0
+        for t, n in counts:
+            size, rows = stats.get(t, (0, 0))
+            total += int(n or 0) * (size // max(rows, 1))
+        return total
+
     def ensure_dst_group_db(self) -> None:
         """DbMailbox.createMailboxDatabase equivalent: clone DDL from an existing group.
 
-        Resume-safe: a schema left empty by a crash between CREATE DATABASE and the DDL
-        import is filled in instead of being treated as ready.
+        SAFETY: a group schema is shared by every mailbox whose id maps to it, so an existing
+        schema is NEVER dropped or altered. Only tables that are missing are created, from a
+        `--no-data --skip-add-drop-table` dump (a plain CREATE TABLE, which fails rather than
+        replaces if mailboxd created the table meanwhile).
         """
-        if self._dst_group_ready():
+        missing = self._dst_missing_group_tables()
+        if missing == []:
             return
         tmpl = self._dst_template_group()
-        log.info("creating %s on %s from template %s", self.p.dst_gdb, self.dst.host.name, tmpl)
-        self.dst.execute(f"CREATE DATABASE IF NOT EXISTS {ident(self.p.dst_gdb)} DEFAULT CHARACTER SET utf8;")
-        # mysqldump emits DROP TABLE IF EXISTS before each CREATE, so a re-import over a
-        # half-imported schema is safe
+        if missing is None:
+            log.info("creating %s on %s from template %s", self.p.dst_gdb, self.dst.host.name, tmpl)
+            self.dst.execute(f"CREATE DATABASE IF NOT EXISTS {ident(self.p.dst_gdb)} DEFAULT CHARACTER SET utf8;")
+            missing = sorted(self.dst.all_tables(tmpl))
+        else:
+            log.warning("%s on %s lacks tables %s; creating them from %s (existing tables untouched)",
+                        self.p.dst_gdb, self.dst.host.name, missing, tmpl)
+        if not missing:
+            return
         ddl = (f"{self.dst.mysqldump_bin} --defaults-file={shlex.quote(self.dst.my_cnf)} -S \"$SOCK\" -u root "
-               f"--no-data --add-drop-table --skip-triggers --skip-comments {sh_ident(tmpl)}")
+               f"--no-data --skip-add-drop-table --skip-triggers --skip-comments "
+               f"{sh_ident(tmpl)} {' '.join(sh_ident(t) for t in missing)}")
         self.dst.host.run(f"{MySQL._ENV}{ddl} | {self.dst.client_cmd(self.p.dst_gdb, env=False)}")
 
     # ------------------------------------------------------------------ staging

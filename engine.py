@@ -8,6 +8,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict
 from typing import Callable, Optional
@@ -25,6 +26,29 @@ from .state import AlreadyMoving, Job, Phase, State
 from .topology import (AccountInfo, ServerInfo, account_info, mailbox_id_in_use, mailbox_row,
                        mta_servers, server_info)
 log = logging.getLogger("zmove.engine")
+
+# Disk space promised to jobs of THIS controller process that passed preflight but have not
+# finished: (host, mount point) -> {job id: bytes}. Lets `batch` see that 10 parallel moves to
+# one destination filesystem need 10x the space, so it never fills a disk other users live on.
+_RESERVED_LOCK = threading.Lock()
+_RESERVED: dict[tuple[str, str], dict[str, int]] = {}
+
+
+def _reserved_by_others(key: tuple[str, str], job_id: str) -> int:
+    with _RESERVED_LOCK:
+        return sum(b for j, b in _RESERVED.get(key, {}).items() if j != job_id)
+
+
+def _reserve_space(job_id: str, needs: dict[tuple[str, str], int]) -> None:
+    with _RESERVED_LOCK:
+        for key, n in needs.items():
+            _RESERVED.setdefault(key, {})[job_id] = int(n)
+
+
+def _release_space(job_id: str) -> None:
+    with _RESERVED_LOCK:
+        for m in _RESERVED.values():
+            m.pop(job_id, None)
 
 DEFAULT_OPTIONS = {
     "max_syncs": None,                 # None -> settings
@@ -123,6 +147,21 @@ class Engine:
         """zmprov -l ma with every argument shell-quoted (an empty value removes the attr)."""
         args = " ".join(f"{k} {shlex.quote(str(v))}" for k, v in attrs.items())
         host.run(f"zmprov -l ma {shlex.quote(account)} {args}", check=check)
+
+    def _restore_status(self, h: Host, job: Job, status: str) -> bool:
+        """Put zimbraAccountStatus back to `status`, but ONLY if the account is still in the
+        maintenance state zmove itself set: a change made meanwhile by an admin (e.g. locking
+        a compromised account) is never undone."""
+        try:
+            cur = account_info(h, job.account).status
+        except Exception:  # noqa: BLE001 LDAP lookup failed: the write below will fail loudly too
+            cur = "maintenance"
+        if cur != "maintenance":
+            self._say(job, f"zimbraAccountStatus is {cur!r} (changed outside zmove); leaving it", "warning")
+            return False
+        self._ma(h, job.account, zimbraAccountStatus=status)
+        caches.flush_account_cache(h, job.account)
+        return True
 
     def soap(self, name: str) -> AdminSoap:
         return AdminSoap(self.host(name), self.s.admin_port, self.s.admin_user, self.s.admin_password,
@@ -355,10 +394,25 @@ class Engine:
                 continue
             srcs = bs.existing_src_dirs(p)
             need[p.dst_volume] = need.get(p.dst_volume, 0) + bs.du(srcH, srcs)
+        # aggregate per destination FILESYSTEM (several volumes / the DB may share one disk)
+        fs_need: dict[tuple[str, str], int] = {}
+        fs_free: dict[tuple[str, str], int] = {}
+        fs_what: dict[tuple[str, str], list[str]] = {}
+
+        def add_need(path: str, n: int, what: str) -> None:
+            info = bs.fs_free(dstH, path)
+            if info is None:
+                warn(f"cannot determine free space for {path} on {job.dst}")
+                return
+            mount, free = info
+            key = (job.dst, mount)
+            fs_need[key] = fs_need.get(key, 0) + int(n)
+            fs_free[key] = free
+            fs_what.setdefault(key, []).append(what)
+
         for vid, n in need.items():
-            free = bs.free_bytes(dstH, dstI.volume(vid).path)
-            if free is not None and free < n * 1.1 + (1 << 30):
-                err(f"not enough space on {job.dst} volume {vid}: need ~{n * 1.1:.0f}B, free {free}B")
+            add_need(dstI.volume(vid).path, n, f"volume {vid}")
+        # NOTE: dst_mailbox_id is unknown before reserve, use a placeholder group for discovery
         # node-to-node SSH: rsync runs on the source and dials the destination as node_ssh_user
         r = srcH.run(f"ssh -p {int(self.s.node_ssh_port)} {self.s.node_ssh_options} "
                      f"{shlex.quote(self.s.node_ssh_user + '@' + job.dst)} true",
@@ -369,15 +423,32 @@ class Engine:
 
         dbm = DbMove(self._dbplan(job, acct, smb, srcI, dstI, dst_id or 1, vmap),
                      self.mysql(job.src), self.mysql(job.dst), self.dry)
+        db_bytes = 0
         try:
             dbm.discover()
+            db_bytes = dbm.estimate_bytes()
         except Exception as e:  # noqa: BLE001
             err(str(e))
+        if db_bytes:
+            # stage copy + live copy coexist until the stage is dropped after cutover
+            datadir = dstH.out("zmlocalconfig -m nokey mysql_data_directory") or \
+                f"{self.s.zimbra_home.rstrip('/')}/db/data"
+            add_need(datadir, 2 * db_bytes, "MySQL datadir (stage + live)")
+        reserve: dict[tuple[str, str], int] = {}
+        for key, n in fs_need.items():
+            want = int(n * 1.1) + (1 << 30)
+            others = _reserved_by_others(key, job.id)
+            if fs_free[key] - others < want:
+                err(f"not enough space on {job.dst}:{key[1]} ({', '.join(fs_what[key])}): need ~{want}B, "
+                    f"free {fs_free[key]}B" + (f" minus {others}B promised to running moves" if others else ""))
+            reserve[key] = want
 
         rep.update({
             "account": asdict(acct), "src_mailbox": asdict(smb), "dst_mailbox": asdict(dmb) if dmb else None,
             "copy": {"blobs": copy_blobs, "secondary_blobs": copy_sec, "search_index": copy_idx},
-            "volume_map": vmap, "bytes_to_copy": sum(need.values()),
+            "volume_map": vmap, "bytes_to_copy": sum(need.values()), "db_bytes": db_bytes,
+            # JSON-safe ("host:mount" keys): `zmove preflight` prints this report
+            "reserve": {f"{h}:{m}": n for (h, m), n in reserve.items()},
             "external_volumes": external_vols,
             "group_tables": sorted(dbm.p.group_tables), "zimbra_tables": sorted(dbm.p.zimbra_tables),
             "dst_group_exists": self.mysql(job.dst).schema_exists(dbm.p.dst_gdb) if dst_id else None,
@@ -486,6 +557,7 @@ class Engine:
             return self._run(job)
         finally:
             hb.set()
+            _release_space(job.id)
 
     def _run(self, job: Job) -> Job:
         try:
@@ -566,12 +638,14 @@ class Engine:
             self._say(job, f"warning: {w}", "warning")
         if rep["errors"]:
             raise MoveError("preflight failed:\n  - " + "\n  - ".join(rep["errors"]))
+        _reserve_space(job.id, {tuple(k.split(":", 1)): n for k, n in (rep.get("reserve") or {}).items()})
         smb = rep["src_mailbox"]
         self._phase(job, Phase.PREFLIGHT_OK, volume_map=rep["volume_map"], copy=rep["copy"],
                     src_mailbox_id=smb["id"], src_group=smb["group_id"],
                     src_index_volume=smb["index_volume_id"], items=smb["items"], size=smb["size"],
                     orig_status=rep["account"]["status"], orig_transport=rep["account"]["mail_transport"],
-                    stray_dst_mailbox=(rep["dst_mailbox"] or {}).get("id"))
+                    stray_dst_mailbox=(rep["dst_mailbox"] or {}).get("id"),
+                    aliases=rep["account"].get("aliases") or [])
 
     def _reserve(self, job: Job) -> None:
         stray = job.data.get("stray_dst_mailbox")
@@ -581,11 +655,10 @@ class Engine:
                        if stray and job.options.get("overwrite") else ""))
         dst = self.mysql(job.dst)
         if stray and job.options.get("overwrite"):
-            row = dst.query(f"SELECT account_id FROM zimbra.mailbox WHERE id={int(stray)}")
+            row = dst.query(f"SELECT account_id, group_id FROM zimbra.mailbox WHERE id={int(stray)}")
             if not row or not row[0] or row[0][0] != job.account_id:
                 raise MoveError(f"refusing to remove stray destination mailbox {stray}: not owned by {job.account}")
-            dstI = self.server(job.dst)
-            gdb = f"mboxgroup{mailbox_group_id(stray, dstI.num_groups)}"
+            gdb = f"mboxgroup{int(row[0][1])}"     # the group it really lives in
             gt = dst.tables_with_column(gdb, "mailbox_id")
             zt = [t for t in dst.tables_with_column("zimbra", "mailbox_id") if t in ZIMBRA_MAILBOX_TABLES]
             dst.execute(DbMove.delete_mailbox_sql(stray, gdb, gt, zt))
@@ -633,11 +706,12 @@ class Engine:
                     last = time.time()
             bs.converge(plans, maxs, thr, on_pass, timeout=self._rsync_timeout(job))
 
-    def _check_home(self, job: Job) -> None:
-        current_home = account_info(self.host(job.dst), job.account).mail_host
-        if current_home != job.src:
-            raise MoveError(f"zimbraMailHost is now {current_home}, not {job.src}; refusing to lock "
+    def _check_home(self, job: Job) -> AccountInfo:
+        info = account_info(self.host(job.dst), job.account)
+        if info.mail_host != job.src:
+            raise MoveError(f"zimbraMailHost is now {info.mail_host}, not {job.src}; refusing to lock "
                             "(re-run preflight)")
+        return info
 
     def _start_lock_budget(self, job: Job) -> Optional[float]:
         mx = int(self.opt(job, "max_lock_seconds") or 0)
@@ -647,7 +721,10 @@ class Engine:
         self._confirm(job, "lock",
                       f"set {job.account} maintenance + LockoutMailbox(start) on {job.src}; "
                       "user-visible outage starts")
-        self._check_home(job)
+        info = self._check_home(job)
+        if info.status != "maintenance":
+            # the status to restore is the one right before WE lock, not the preflight one
+            job.data["orig_status"] = info.status
         # journal the intent first: a crash between the LDAP change and the LOCKED commit must
         # still make abort/unlock restore the source
         job.data["locking"] = True
@@ -672,7 +749,7 @@ class Engine:
                 self._say(job, f"zimbraMailHost already {job.dst}: committing FLIPPED", "warning")
                 self._phase(job, Phase.FLIPPED, flipped_at=time.time(),
                             new_transport=replace_host_in_transport(job.data.get("orig_transport") or "",
-                                                                    job.dst))
+                                                                    job.dst, self.server(job.dst).lmtp_port))
                 return
         self._confirm(job, "lock", f"re-assert maintenance + LockoutMailbox(start) on {job.src} "
                                    "(resuming a locked job)")
@@ -735,7 +812,11 @@ class Engine:
                           f"insert stage into live tables on {job.dst} as mailbox {dbm.p.dst_id}")
             if mailbox_id_in_use(dbm.dst, dbm.p.dst_id):     # resumed after a committed merge
                 self._delete_dst_live(dbm, job)
-            dbm.merge(timeout=dbt())
+            # Budget is checked BEFORE the merge but the merge itself is never killed: killing
+            # the ssh client does not stop the remote mysql, and a huge rollback would hold
+            # locks in a group schema other mailboxes live in.
+            self._deadline_check(job)
+            dbm.merge(timeout=self._db_timeout(job))
             diff = dbm.compare("src_mapped", "live", verify, timeout=dbt())
             if diff:
                 dbm.delete_live_dst()
@@ -750,8 +831,8 @@ class Engine:
         self._deadline_check(job)
         h = self.host(job.dst)
         orig_transport = job.data.get("orig_transport") or ""
-        transport = replace_host_in_transport(orig_transport, job.dst)
-        if orig_transport and transport == orig_transport:
+        transport = replace_host_in_transport(orig_transport, job.dst, self.server(job.dst).lmtp_port)
+        if orig_transport and transport == orig_transport and not orig_transport.lower().startswith("lmtp"):
             self._say(job, f"keeping non-LMTP mailTransport {orig_transport!r}; verify it routes to {job.dst}", "warning")
         self._ma(h, job.account, zimbraMailHost=job.dst, zimbraMailTransport=transport)
         self._phase(job, Phase.FLIPPED, flipped_at=time.time(), new_transport=transport)
@@ -764,15 +845,14 @@ class Engine:
         if job.phase < Phase.CACHES_PURGED:
             caches.flush_account_cache(h, job.account)
             if not self.opt(job, "skip_memcache_purge"):
-                caches.purge_proxy_routes(h, job.account)
+                caches.purge_proxy_routes(h, job.account, job.data.get("aliases") or [])
                 n = caches.delete_memcached_keys(h, job.account_id)
                 self._say(job, f"memcached account keys deleted: {n}")
             self._phase(job, Phase.CACHES_PURGED)
         if job.phase < Phase.UNLOCKED:
             # Source mailbox intentionally STAYS in maintenance lockout until purge/rollback:
             # nothing on the source JVM may touch the old copy any more.
-            self._ma(h, job.account, zimbraAccountStatus=job.data.get("orig_status") or "active")
-            caches.flush_account_cache(h, job.account)
+            self._restore_status(h, job, job.data.get("orig_status") or "active")
             locked = time.time() - job.data.get("locked_at", time.time())
             self._phase(job, Phase.UNLOCKED, lock_seconds=round(locked, 2))
         if job.phase < Phase.DONE:
@@ -782,7 +862,9 @@ class Engine:
             if self.opt(job, "flush_mta"):
                 mta = list(self.s.mta_hosts) or mta_servers(h)
                 if mta:
-                    caches.flush_mta_queues([self.host(m) for m in mta], job.account, self.s.zimbra_home)
+                    n = caches.flush_mta_queues([self.host(m) for m in mta], job.account,
+                                                self.s.zimbra_home, job.data.get("aliases") or [])
+                    self._say(job, f"rescheduled {n} deferred message(s) for this account")
                 else:
                     self._say(job, "no MTA hosts configured or discovered; deferred mail will "
                                    "retry on postfix schedule", "warning")
@@ -808,9 +890,7 @@ class Engine:
         status = job.data.get("orig_status") or "active"
         for hn in dict.fromkeys((job.src, job.dst)):   # zmprov -l works from any mailstore
             try:
-                h = self.host(hn)
-                self._ma(h, job.account, zimbraAccountStatus=status)
-                caches.flush_account_cache(h, job.account)
+                self._restore_status(self.host(hn), job, status)
                 break
             except Exception as e:  # noqa: BLE001
                 errors.append(f"restore zimbraAccountStatus={status} via {hn}: {e}")
@@ -901,7 +981,10 @@ class Engine:
             raise MoveError(f"job {job.id} is still being run by {job.owner}; stop it first")
         dbm, plans, bs = self._ctx(job, prepare=False)
         h = self.host(job.dst)
-        orig_status = job.data.get("orig_status") or "active"
+        before = account_info(h, job.account).status
+        # restore to the status the account has NOW (an admin may have changed it after the
+        # move); only a job that never got past maintenance goes back to the pre-move status
+        orig_status = (job.data.get("orig_status") or "active") if before == "maintenance" else before
         self._ma(h, job.account, zimbraAccountStatus="maintenance")
         caches.flush_account_cache(h, job.account)
         cur = dbm.live_state()
@@ -914,7 +997,7 @@ class Engine:
                             f"{merged or job.data.get('merged_max_change')}); do a reverse move or --force")
         self._ma(h, job.account, zimbraMailHost=job.src,
                  zimbraMailTransport=job.data.get("orig_transport") or "")
-        caches.purge_proxy_routes(h, job.account)
+        caches.purge_proxy_routes(h, job.account, job.data.get("aliases") or [])
         caches.delete_memcached_keys(h, job.account_id)
         if not self.opt(job, "skip_lockout"):
             self._lockout(job.src, job.account, "end")
@@ -988,8 +1071,12 @@ class Engine:
                 log.warning("unlock: abort of job %s failed: %s", j.id, e)
         last = j or next(iter(self.state.find(account=acct.id, limit=1)), None)
         status = (last.data.get("orig_status") if last else None) or "active"
-        self._ma(any_h, account, zimbraAccountStatus=status)
-        caches.flush_account_cache(any_h, account)
+        cur = account_info(any_h, account).status
+        if cur == "maintenance":
+            self._ma(any_h, acct.name, zimbraAccountStatus=status)
+            caches.flush_account_cache(any_h, acct.name)
+        else:
+            log.warning("unlock: %s status is %r (not maintenance); left unchanged", acct.name, cur)
         # after cutover the old copy on the source keeps its lockout on purpose; only the
         # current home is unlocked here
         self._lockout(acct.mail_host, account, "end")

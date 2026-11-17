@@ -33,6 +33,7 @@ def test_locator_case_and_transport():
     assert paths.replace_host_in_transport("lmtp:a:7025", "b") == "lmtp:b:7025"
     assert paths.replace_host_in_transport("smtp:[relay]:25", "b") == "smtp:[relay]:25"
     assert paths.replace_host_in_transport("", "b") == "lmtp:b:7025"
+    assert paths.replace_host_in_transport("lmtp:a:7025", "b", 7026) == "lmtp:b:7026"
 
 
 def test_ident_and_quote():
