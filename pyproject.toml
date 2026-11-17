@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmove"
+dynamic = ["version"]
+description = "Online mailbox move for Zimbra FOSS/OSE (zmmboxmove-compatible)"
+requires-python = ">=3.9"
+
+[project.scripts]
+zmove = "zmove.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+# the repository root is the package directory
+package-dir = {"zmove" = "."}
+packages = ["zmove"]
+
+[tool.setuptools.dynamic]
+version = {attr = "zmove.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

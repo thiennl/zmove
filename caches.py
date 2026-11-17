@@ -44,9 +44,10 @@ def delete_memcached_keys(host: Host, account_id: str) -> int:
     return deleted
 
 
-def flush_mta_queues(hosts: list[Host], account: str) -> None:
+def flush_mta_queues(hosts: list[Host], account: str, zimbra_home: str = "/opt/zimbra") -> None:
     """Deliver mail deferred (450 4.2.1) during the lock immediately instead of waiting for retry."""
+    postqueue = shlex.quote(zimbra_home.rstrip("/") + "/common/sbin/postqueue")
     for h in hosts:
-        r = h.run("/opt/zimbra/common/sbin/postqueue -f", check=False)
+        r = h.run(f"{postqueue} -f", check=False)
         if r.rc != 0:
             log.warning("[%s] postqueue -f failed rc=%s: %s", h.name, r.rc, r.err.strip()[-500:])

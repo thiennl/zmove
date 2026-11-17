@@ -87,7 +87,7 @@ class BlobSync:
         rpath = f"mkdir -p {shlex.quote(plan.dst_dir)} && {self.s.rsync_bin}"
         cmd = (f"{nice}{self.s.rsync_bin} {' '.join(opts)} -e {shlex.quote(e)} "
                f"--rsync-path={shlex.quote(rpath)} {srcs_q} "
-               f"{self.s.node_ssh_user}@{self.dst.name}:{dq}")
+               f"{shlex.quote(self.s.node_ssh_user + '@' + self.dst.name)}:{dq}")
         return self.src, cmd
 
     def sync_once(self, plans: list[DirPlan], final: bool = False,
@@ -128,12 +128,16 @@ class BlobSync:
         return passes
 
     def inventory(self, host: Host, dirs: list[str]) -> tuple[int, int]:
-        """(file count, apparent bytes) under the given dirs."""
+        """(file count, apparent bytes) under the given dirs, as rsync would merge them.
+
+        Several source dirs are merged into one destination dir, so a relative path present in
+        more than one source (blob names are <item>-<rev>.msg, i.e. same name == same content)
+        counts once, exactly as it ends up on the destination."""
         if not dirs:
             return 0, 0
         dq = " ".join(shlex.quote(d) for d in dirs)
-        out = host.out(f"find {dq} -type f -printf '%s\\n' 2>/dev/null | "
-                       "awk '{n++; s+=$1} END {printf \"%d %d\", n, s}'")
+        out = host.out(f"find {dq} -type f -printf '%P\\t%s\\n' 2>/dev/null | "
+                       "awk -F'\\t' '!seen[$1]++ {n++; s+=$2} END {printf \"%d %d\", n, s}'")
         parts = out.split()
         return (int(parts[0]), int(parts[1])) if len(parts) == 2 else (0, 0)
 

@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import shlex
+
 from .db import MySQL, q
 from .paths import Volume
 from .remote import Host
@@ -82,7 +84,7 @@ class MailboxRow:
 
 def server_info(host: Host, mysql: MySQL) -> ServerInfo:
     attrs = parse_zmprov_attrs(host.out(
-        f"zmprov -l gs {host.name} zimbraId zimbraConfiguredServerIDForBlobDirEnabled "
+        f"zmprov -l gs {shlex.quote(host.name)} zimbraId zimbraConfiguredServerIDForBlobDirEnabled "
         "zimbraMailboxMoveSkipBlobs zimbraMailboxMoveSkipHsmBlobs zimbraMailboxMoveSkipSearchIndex"))
     version = host.out("zmcontrol -v").splitlines()[0].strip()
     groups = int(host.out("zmlocalconfig -m nokey zimbra_mailbox_groups") or 100)
@@ -120,7 +122,7 @@ def server_info(host: Host, mysql: MySQL) -> ServerInfo:
 
 def account_info(host: Host, account: str) -> AccountInfo:
     attrs = parse_zmprov_attrs(host.out(
-        f"zmprov -l ga {account} zimbraId zimbraMailHost zimbraMailTransport zimbraAccountStatus mail"))
+        f"zmprov -l ga {shlex.quote(account)} zimbraId zimbraMailHost zimbraMailTransport zimbraAccountStatus mail"))
     if not first(attrs, "zimbraId"):
         raise LookupError(f"account {account} not found")
     return AccountInfo(name=account, id=first(attrs, "zimbraId", ""),

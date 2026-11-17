@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -126,6 +127,44 @@ class State:
     def beat(self, j: Job) -> None:
         j.heartbeat = time.time()
         self.db.execute("UPDATE jobs SET heartbeat=? WHERE id=?", (j.heartbeat, j.id))
+
+    HEARTBEAT_INTERVAL = 30.0
+    HEARTBEAT_STALE = 120.0
+
+    def start_heartbeat(self, job_id: str, interval: Optional[float] = None) -> threading.Event:
+        """Beat in the background (own SQLite connection) while a long rsync/DB step runs, so
+        another controller can tell a live job from a crashed one. Set the event to stop."""
+        stop = threading.Event()
+        interval = interval or self.HEARTBEAT_INTERVAL
+
+        def loop() -> None:
+            con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            try:
+                while not stop.wait(interval):
+                    try:
+                        con.execute("UPDATE jobs SET heartbeat=? WHERE id=?", (time.time(), job_id))
+                    except sqlite3.Error:
+                        pass
+            finally:
+                con.close()
+
+        threading.Thread(target=loop, name=f"zmove-hb-{job_id}", daemon=True).start()
+        return stop
+
+    def owner_alive(self, j: Job) -> bool:
+        """True if another process may still be driving this job."""
+        if j.status != "running" or not j.owner or j.owner == self.owner_tag():
+            return False
+        host, _, pid = j.owner.rpartition(":")
+        if host == socket.gethostname() and pid.isdigit():
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+        return (time.time() - (j.heartbeat or 0)) < self.HEARTBEAT_STALE
 
     def get(self, job_id: str) -> Job:
         r = self.db.execute(f"SELECT {self._COLS} FROM jobs WHERE id=?", (job_id,)).fetchone()

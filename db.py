@@ -53,17 +53,19 @@ class TableInfo:
 
 
 class MySQL:
-    def __init__(self, host: Host, mysql_bin: str, mysqldump_bin: str):
+    def __init__(self, host: Host, mysql_bin: str, mysqldump_bin: str,
+                 my_cnf: str = "/opt/zimbra/conf/my.cnf"):
         self.host = host
         self.mysql_bin = mysql_bin
         self.mysqldump_bin = mysqldump_bin
+        self.my_cnf = my_cnf
 
     # Credentials: MYSQL_PWD env var (never on argv), socket from localconfig.
     _ENV = ('export MYSQL_PWD="$(zmlocalconfig -s -m nokey mysql_root_password)"; '
             'SOCK="$(zmlocalconfig -m nokey mysql_socket)"; ')
 
     def client_cmd(self, db: Optional[str] = None, batch: bool = True, env: bool = True) -> str:
-        args = [self.mysql_bin, "--defaults-file=/opt/zimbra/conf/my.cnf", '-S "$SOCK"', "-u root",
+        args = [self.mysql_bin, f"--defaults-file={shlex.quote(self.my_cnf)}", '-S "$SOCK"', "-u root",
                 "--max_allowed_packet=1G"]
         if batch:
             args += ["--batch", "-N", "--raw"]
@@ -73,7 +75,7 @@ class MySQL:
 
     def dump_cmd(self, db: str, tables: Iterable[str], where: str, replace: bool = False) -> str:
         tbls = " ".join(sh_ident(t) for t in tables)
-        opts = ["--defaults-file=/opt/zimbra/conf/my.cnf", '-S "$SOCK"', "-u root",
+        opts = [f"--defaults-file={shlex.quote(self.my_cnf)}", '-S "$SOCK"', "-u root",
                 "--no-create-info", "--skip-triggers", "--complete-insert", "--skip-add-locks",
                 "--skip-disable-keys", "--single-transaction", "--quick", "--hex-blob",
                 "--skip-tz-utc", "--skip-comments", "--extended-insert", "--max_allowed_packet=1G",
