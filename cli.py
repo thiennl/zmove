@@ -113,14 +113,31 @@ def _print_job(j, as_json: bool = False) -> None:
 
 
 def _background(argv: list[str], log_dir: str) -> int:
-    argv = [a for a in argv if a != "--background"]
-    logf = os.path.join(log_dir, "background.log")
-    os.makedirs(os.path.dirname(logf), exist_ok=True)
-    with open(logf, "a") as f:
-        p = subprocess.Popen([sys.executable, "-m", "zmove", *argv, "--yes"], stdout=f, stderr=f,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
-    print(f"started in background, pid {p.pid}; follow with `zmove query` / {logf}")
-    return 0
+     argv = [a for a in argv if a != "--background"]
+     logf = os.path.join(log_dir, "background.log")
+     os.makedirs(os.path.dirname(logf), exist_ok=True)
+     if "__compiled__" in globals() or getattr(sys, "frozen", False):
+         # Frozen (Nuitka onefile): the binary takes the subcommand directly
+         # ("-m zmove" does not exist). Re-exec via the launcher path from
+         # argv[0]: /proc/self/exe points at the payload inside the unpack dir,
+         # which the exiting parent deletes out from under the child.
+         exe = sys.argv[0]
+         if not os.path.isabs(exe):
+             for d in os.environ.get("PATH", "").split(os.pathsep):
+                 cand = os.path.join(d, exe)
+                 if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                     exe = cand
+                     break
+             else:
+                 exe = os.path.abspath(exe)
+         cmd = [exe, *argv, "--yes"]
+     else:
+         cmd = [sys.executable, "-m", "zmove", *argv, "--yes"]
+     with open(logf, "a") as f:
+         p = subprocess.Popen(cmd, stdout=f, stderr=f,
+                              stdin=subprocess.DEVNULL, start_new_session=True)
+     print(f"started in background, pid {p.pid}; follow with `zmove query` / {logf}")
+     return 0
 
 
 def _confirm_purge(job) -> bool:
