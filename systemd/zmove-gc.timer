@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly zmove garbage collection
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target

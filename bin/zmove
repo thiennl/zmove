@@ -1,0 +1,7 @@
+#!/bin/sh
+# Direct-launch wrapper: no install needed.
+# Usage: link or copy this file into PATH, e.g.
+#   ln -s /opt/zmove/bin/zmove /usr/local/bin/zmove
+here=$(dirname "$(readlink -f "$0")")
+ROOT=$(cd "$here/.." && pwd)
+exec env PYTHONPATH="$(dirname "$ROOT")${PYTHONPATH:+:$PYTHONPATH}" python3 -m zmove "$@"

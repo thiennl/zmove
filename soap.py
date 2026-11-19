@@ -81,6 +81,18 @@ class AdminSoap:
         b = self._post({name: req}, self.token(), mutating=mutating)
         return b.get(name.replace("Request", "Response"), {})
 
+    def move_mailbox(self, name: str, src: str, dest: str, sync: bool = False,
+                     skip_remote_lockout: bool = False, ng_migration: bool = False) -> dict:
+        """MoveMailboxRequest (NE). Must be sent to the *destination* server;
+        src/dest are safety checks (src must equal the account's current
+        mailHost, dest must be this server). Mirrors MboxMoveUtil.move()."""
+        return self.call("MoveMailboxRequest", {"account": {
+            "name": name, "src": src, "dest": dest,
+            "sync": bool(sync),
+            "skipRemoteLockout": bool(skip_remote_lockout),
+            "ngMigration": bool(ng_migration),
+        }}, mutating=True)
+
     # -- specific requests -------------------------------------------------
     def lockout(self, account: str, op: str) -> None:
         """LockoutMailboxRequest (OSE: service/admin/LockoutMailbox.java). op = start|end."""

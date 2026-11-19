@@ -36,7 +36,9 @@ class Settings:
     state_db: str = "~/.local/share/zmove/state.db"
     log_dir: str = "~/.local/share/zmove/logs"
     max_syncs: int = 10
-    sync_finish_threshold_ms: int = 30000
+    # NE code default is 180000 (MoveMailbox.DEFAULT_SYNC_FINISH_THRESHOLD);
+    # NE soap doc says 30000. Follow the shipped code.
+    sync_finish_threshold_ms: int = 180000
     rsync_bwlimit_kbps: int = 0
     ionice: bool = True
     max_lock_seconds: int = 900           # hard watchdog: abort+unlock if exceeded before flip

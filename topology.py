@@ -51,7 +51,7 @@ class ServerInfo:
     current_msg: int = 0
     current_secondary: Optional[int] = None
     current_index: int = 0
-    mailboxd_started: Optional[int] = None   # epoch seconds of mailboxd JVM start
+    has_mail_client: bool = False  # NE Server.hasMailClientService gate (mailbox service on dest)
 
     def volume(self, vid: int) -> Volume:
         for v in self.volumes:
@@ -88,7 +88,7 @@ def server_info(host: Host, mysql: MySQL) -> ServerInfo:
     attrs = parse_zmprov_attrs(host.out(
         f"zmprov -l gs {shlex.quote(host.name)} zimbraId zimbraConfiguredServerIDForBlobDirEnabled "
         "zimbraMailboxMoveSkipBlobs zimbraMailboxMoveSkipHsmBlobs zimbraMailboxMoveSkipSearchIndex "
-        "zimbraLmtpBindPort"))
+        "zimbraLmtpBindPort zimbraServiceEnabled"))
     version = host.out("zmcontrol -v").splitlines()[0].strip()
     groups = int(host.out("zmlocalconfig -m nokey zimbra_mailbox_groups") or 100)
     started = host.out("pid=$(pgrep -u zimbra -f 'java.*mailboxd' | head -1); "
@@ -106,6 +106,7 @@ def server_info(host: Host, mysql: MySQL) -> ServerInfo:
         move_skip_index=tf(first(attrs, "zimbraMailboxMoveSkipSearchIndex")),
         lmtp_port=int(first(attrs, "zimbraLmtpBindPort", "7025") or 7025),
         mailboxd_started=int(started) if started.isdigit() else None,
+        has_mail_client=("mailbox" in (attrs.get("zimbraServiceEnabled") or [])),
     )
     has_store_type = mysql.scalar(
         "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='zimbra' "

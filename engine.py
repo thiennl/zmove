@@ -119,6 +119,22 @@ def in_window(window: str, now: Optional[dt.datetime] = None) -> bool:
     return start <= t < end if start <= end else (t >= start or t < end)
 
 
+def pre_move_snapshot(rep: dict) -> dict:
+    """Point-in-time record of the source home, stored in the journal at
+    PREFLIGHT_OK for forensics and rollback messages (visible via
+    `zmove query --json`)."""
+    acct = rep.get("account") or {}
+    return {
+        "taken_at": time.time(),
+        "mail_host": acct.get("mail_host", ""),
+        "status": acct.get("status", ""),
+        "transport": acct.get("mail_transport", ""),
+        "mailbox": rep.get("src_mailbox", {}),
+        "volume_map": rep.get("volume_map", {}),
+        "copy": rep.get("copy", {}),
+    }
+
+
 class Engine:
     def __init__(self, settings: Settings, state: State, dry_run: bool = False,
                  progress: Optional[Callable[[str], None]] = None,
@@ -304,6 +320,16 @@ class Engine:
         for k in ("version", "db_version", "index_version"):
             if getattr(srcI, k) != getattr(dstI, k):
                 err(f"{k} differs: {job.src}={getattr(srcI, k)} {job.dst}={getattr(dstI, k)}")
+        if not dstI.has_mail_client:
+            err(f"specified targetHost does not correspond to a valid mailclient server "
+                f"with service webapp enabled: {job.dst} (NE hasMailClientService gate)")
+        admin_user = (self.s.admin_user or "").strip().lower()
+        if admin_user and admin_user == acct.name.lower():
+            err("Account being moved is the same as the one used for authentication. "
+                "Administrators may not move themselves directly (NE MoveMailbox gate); "
+                "rerun with another admin account")
+        elif not admin_user:
+            warn("admin_user is not configured; NE self-move gate cannot be verified")
         for h in (srcH, dstH):
             if h.run("zmmailboxdctl status", check=False, mutating=False).rc != 0:
                 err(f"mailboxd not running on {h.name}")
@@ -344,12 +370,14 @@ class Engine:
                 left_at = old.data["rolled_back_at"]
             if not left_at or job.options.get("force"):
                 continue
+            fix = (f"run: ssh zimbra@{job.dst} 'zmmailboxdctl restart' "
+                   f"(JVM holds stale accountId->mailboxId), then re-run preflight")
             if dstI.mailboxd_started is None:
                 err(f"{acct.name} was homed on {job.dst} before (job {old.id}) and mailboxd start time "
-                    "is unknown; restart mailboxd there or use --force")
+                    f"is unknown; {fix} or use --force")
             elif left_at > dstI.mailboxd_started:
-                err(f"{acct.name} left {job.dst} (job {old.id}) after its mailboxd started; restart "
-                    f"mailboxd on {job.dst} first (stale accountId->mailboxId cache) or use --force")
+                err(f"{acct.name} left {job.dst} (job {old.id}) after its mailboxd started; {fix} "
+                    f"or use --force")
 
         if (self.opt(job, "db_strategy") == "delta" and self.opt(job, "verify") != "full"
                 and not self.opt(job, "force")):
@@ -645,7 +673,8 @@ class Engine:
                     src_index_volume=smb["index_volume_id"], items=smb["items"], size=smb["size"],
                     orig_status=rep["account"]["status"], orig_transport=rep["account"]["mail_transport"],
                     stray_dst_mailbox=(rep["dst_mailbox"] or {}).get("id"),
-                    aliases=rep["account"].get("aliases") or [])
+                    aliases=rep["account"].get("aliases") or [],
+                    snapshot=pre_move_snapshot(rep))
 
     def _reserve(self, job: Job) -> None:
         stray = job.data.get("stray_dst_mailbox")

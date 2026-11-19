@@ -35,6 +35,17 @@ def read_plan(path: str) -> list[Item]:
     return items
 
 
+def _confirm_continue(msg: str) -> bool:
+    """Ask to proceed; non-TTY/EOF always declines (never auto-proceed blind)."""
+    import sys
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(msg).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 class Batch:
     def __init__(self, settings: Settings, parallel: int = 4, per_server: int = 2,
                  max_cutovers: int = 2, dry_run: bool = False):
@@ -74,7 +85,7 @@ class Batch:
         except Exception as e:  # noqa: BLE001
             return it, None, f"{type(e).__name__}: {e}"
 
-    def run(self, items: list[Item], options: dict) -> list[tuple[Item, Optional[str], Optional[str]]]:
+    def _run_all(self, items: list[Item], options: dict) -> list[tuple[Item, Optional[str], Optional[str]]]:
         results = []
         with ThreadPoolExecutor(max_workers=max(1, self.parallel)) as ex:
             futs = [ex.submit(self._one, it, options) for it in items]
@@ -86,3 +97,25 @@ class Batch:
                 else:
                     log.info("OK   %s %s->%s job=%s", it.account, it.src, it.dst, jid)
         return results
+
+    def run(self, items: list[Item], options: dict, canary: int = 0) -> list[tuple[Item, Optional[str], Optional[str]]]:
+        """Run a batch, optionally stopping after a canary prefix.
+
+        With canary=N>0 the first N items run first: any failure stops the
+        batch; otherwise the operator is asked before the rest (non-TTY
+        always stops — re-run without --canary for the remainder).
+        """
+        if canary <= 0 or canary >= len(items):
+            return self._run_all(items, options)
+        first, rest = items[:canary], items[canary:]
+        results = self._run_all(first, options)
+        failed = [r for r in results if r[2]]
+        if failed:
+            log.error("canary: %d of first %d failed, stopping before remaining %d",
+                      len(failed), len(first), len(rest))
+            return results
+        if not _confirm_continue(
+                f"canary ok ({len(first)} moved); continue with remaining {len(rest)}? [y/N] "):
+            log.warning("canary paused by operator/non-TTY; %d remaining skipped", len(rest))
+            return results
+        return results + self._run_all(rest, options)

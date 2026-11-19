@@ -47,7 +47,7 @@ Nguồn: `soap/src/java/com/zimbra/soap/admin/type/MoveMailboxInfo.java:29-185`.
 | `secondaryBlobs` | `config` | `include / exclude / config` — blob secondary/HSM (chỉ có nghĩa khi `blobs` không bị exclude) |
 | `searchIndex` | `config` | `include / exclude / config` — index |
 | `maxSyncs` | `10` | Số vòng sync tối đa khi account còn unlocked |
-| `syncFinishThreshold` | `30000` ms | Ngưỡng dừng pha unlocked: vòng sync cuối ≤ ngưỡng |
+| `syncFinishThreshold` | `180000` ms (code; doc ghi `30000`) | Ngưỡng dừng pha unlocked: vòng sync cuối ≤ ngưỡng |
 | `sync` | false | `1` = chạy đồng bộ, chờ tới khi xong |
 | `ngMigration` | — | Flag migration NG (không có tài liệu kèm trong bundle) |
 | `skipRemoteLockout` | false | Bỏ lockout mailbox phía remote — tương thích ngược server legacy |
@@ -174,6 +174,34 @@ Giá trị per-request `blobs / secondaryBlobs / searchIndex = include|exclude|c
 | Blob copy + inventory NE | rsync converge `maxSyncs/threshold` + `--checksum` vòng final + so `(count,bytes)`; external/S3 volumes skip copy, chỉ remap `locator` (cần `shared_volumes` explicit) | S3 centralized: không copy bytes |
 | Cleanup task `FailedCleanupTaskInterval=20m` | `gc` thủ công (`--older-than`, default 24h) dọn stage + blob dirs; cron/systemd timer do operator đặt | Không có server-side scheduler |
 | `sync=1` đồng bộ / `verify_tls` | `--sync` no-op (luôn đồng bộ); `verify_tls` + `--cacert` thật (mặc định `-k`) | Tương thích tên, không giả vờ semantics |
+
+## 7c. Port `zmmboxmove` sang Python (`compat_mboxmove.py`, `soap.move_mailbox`)
+> `zmove mboxmove -a <email> -f <src> -t <dst>` hoặc `python -m zmove.compat_mboxmove`
+> (prog `zmmboxmove`). Thin client gửi `MoveMailboxRequest` tới dest — không tự
+> copy dữ liệu như `zmove move`.
+| Java (`MboxMoveUtil`) | Python port | Ghi chú |
+|---|---|---|
+| `LicenseAdaptor.check(BACKUP_ENABLED)` | Bỏ hẳn — server tự enforce, client gate sẽ fail-closed oan trên FOSS | Cố ý lệch Java để tránh chặn sai |
+| `Provisioning.get(ServerBy)` + `hasMailClientService` | `zmprov -l gs` + `has_mail_client` (`topology.py`) | Message lỗi giữ nguyên văn NE |
+| `account{name,src,dest,sync,skipRemoteLockout,ngMigration}` (`--force`→`skipRemoteLockout`) | `AdminSoap.move_mailbox()` — JSON bool, đã verify live: `already-on-this-server` (XML) và `NO_SUCH_ACCOUNT` (JSON), đều dừng trước mutation | `sync`→in `Mailbox move completed successfully`, ngược lại `started`; exit 0/1 |
+| `--authtoken/--authtokenfile` (JSON), `-s` (bị `--to` override) | Hỗ trợ tương đương; `-s` vẫn bị override như Java | Không port interactive prompt của `SoapCLI.auth()` |
+
+## 7d. Port tác vụ server NE sang Python (`ne_server.py`, `zmove ne-move`)
+> `NeServerMove` chạy đúng thứ tự `handleNetworkRequest/moveIt`: checks →
+> `RegisterMailboxMoveOut` → unlocked rsync rounds → lock → final sync → full
+> DB copy *while locked* → cutover → purge cache → unregister. Không journal,
+> không resume (như `MailboxMoveThread`).
+| NE (`MoveMailbox.java`) | Python port | Ghi chú |
+|---|---|---|
+| `DEFAULT_MAX_SYNCS=10`, `DEFAULT_SYNC_FINISH_THRESHOLD=180000` | Hằng cùng tên, default từ `opts` → settings | Đã sửa settings theo code (không theo doc 30s) |
+| `getRemoteVersionInfo` (mbox/db/index) | So `version/db_version/index_version` 2 đầu | Lệch là dừng trước mutation |
+| `ALREADY_EXISTS → Purge it with zmpurgeoldmbox first` | Giữ nguyên message, không có `--overwrite` như engine | Fail-closed đúng NE |
+| `downloadAndExtractZip` + `blobs-sync-token` | Bytes đi bằng rsync volume (đường đã chứng minh của zmove); điều kiện dừng vòng và skip flags giữ nguyên | End-state giống hệt, khác cơ chế vận chuyển |
+| `copyDatabase` full export/import while locked | `DbMove.final("full")` + `compare` + `merge` 1 txn | Merge nguyên tử hơn import thẳng vào live của NE |
+| Live orphan-blob sweep, tempdir cleanup | Chỉ dọn stage/tempdir; **bỏ** sweep live (sai locator math sẽ xóa nhầm dữ liệu) | Gap parity đã ghi nhận |
+| `MailboxMoveThread` async | `run(sync=False)` thread non-daemon; CLI `ne-move` luôn sync | Control node thoát là thread chết nên không async thật |
+| `FailedCleanupTaskInterval` dọn move lỗi | Best-effort unregister + unlock trong `finally` | An toàn hơn NE, không chờ 20m |
+| `Register/UnregisterMailboxMoveOut` | `ALREADY_BEING_MOVED_OUT` vẫn abort; `UNKNOWN_DOCUMENT` (FOSS) → warn + chạy tiếp không registry | Port nhắm FOSS nên không đòi handler NE |
 
 ## 8. Tài liệu tham chiếu
 

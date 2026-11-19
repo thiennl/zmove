@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "zmove"
 dynamic = ["version"]
 description = "Online mailbox move for Zimbra FOSS/OSE (zmmboxmove-compatible)"
+readme = "move-mailbox-steps.md"
 requires-python = ">=3.9"
+license = { text = "GPL-2.0-only" }
 
 [project.scripts]
 zmove = "zmove.cli:main"
@@ -24,3 +26,6 @@ version = {attr = "zmove.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+zmove = ["*.md"]

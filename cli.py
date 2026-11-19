@@ -19,7 +19,12 @@ import sys
 
 from . import __version__
 from .batch import Batch, read_plan
+from .compat_mboxmove import add_mboxmove_args as _add_mboxmove_args
+from .compat_mboxmove import bind_exit1 as _bind_exit1
 from .config import load
+from .ne_server import NeServerMove
+from .ne_server import add_ne_move_args as _add_ne_move_args
+from .ne_server import ne_opts as _ne_opts
 from .engine import Engine, MoveError
 from .state import Job, Phase, State
 from .topology import account_info
@@ -61,7 +66,7 @@ def _add_move_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("zmmboxmove-compatible")
     g.add_argument("--max-syncs", type=int, help="max unlocked sync passes (NE default 10)")
     g.add_argument("--sync-finish-threshold", type=int, metavar="MS",
-                   help="stop unlocked passes when one takes <= MS (NE default 30s)")
+                   help="stop unlocked passes when one takes <= MS (NE code default 180s; NE doc says 30s)")
     g.add_argument("--sync", action="store_true",
                    help="NE compat no-op: zmove always runs synchronously and waits for completion")
     for name in ("blobs", "secondary-blobs", "search-index"):
@@ -118,6 +123,19 @@ def _background(argv: list[str], log_dir: str) -> int:
     return 0
 
 
+def _confirm_purge(job) -> bool:
+    """Destructive-op gate: the operator must retype the account email.
+    Non-TTY/EOF always declines."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        ans = input(f"type '{job.account}' to purge mailbox "
+                    f"{job.data.get('src_mailbox_id')} on {job.src}: ").strip()
+    except EOFError:
+        return False
+    return ans == job.account
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(prog="zmove", description="Online mailbox move for Zimbra FOSS "
@@ -134,6 +152,11 @@ def main(argv=None) -> int:
     p.add_argument("-t", "--to", dest="dst", required=True)
     _add_move_args(p)
 
+    p = sub.add_parser("mboxmove", help="NE zmmboxmove port: ask the destination server to move a mailbox")
+    _add_mboxmove_args(p)
+    p = sub.add_parser("ne-move", help="NE-faithful server-side move (full DB copy while locked, no journal)")
+    _add_ne_move_args(p)
+
     p = sub.add_parser("preflight", help="all checks + estimates, changes nothing")
     p.add_argument("account")
     p.add_argument("-f", "--from", dest="src", required=True)
@@ -144,7 +167,8 @@ def main(argv=None) -> int:
     p.add_argument("plan")
     p.add_argument("--parallel", type=int, default=4)
     p.add_argument("--per-server", type=int, default=2, help="max concurrent jobs touching a server")
-    p.add_argument("--max-cutovers", type=int, default=2, help="max mailboxes locked at the same time")
+    p.add_argument("--canary", type=int, default=0, metavar="N",
+                   help="move first N as canary; pause for confirm before the rest (non-TTY stops)")
     _add_move_args(p)
 
     p = sub.add_parser("query", help="show moves (zmmboxmovequery)")
@@ -210,6 +234,17 @@ def main(argv=None) -> int:
             rep = eng.plan(tmp)
             print(json.dumps(rep, indent=2, default=str))
             return 1 if rep["errors"] else 0
+        if a.cmd == "mboxmove":
+            from .compat_mboxmove import run_mboxmove
+            return run_mboxmove(s, a.account, a.src, a.dst, sync=a.sync,
+                                force=a.force, ng_migration=a.ng_migration,
+                                authtoken=a.authtoken,
+                                authtokenfile=a.authtokenfile)
+
+        if a.cmd == "ne-move":
+            ne = NeServerMove(s, progress=lambda m: print(m, flush=True))
+            ne.run(a.account, a.src, a.dst, _ne_opts(a), sync=True)
+            return 0
 
         if a.cmd == "move":
             job = eng.new_job(a.account, a.src, a.dst, _move_opts(a))
@@ -226,7 +261,7 @@ def main(argv=None) -> int:
                 return 2
             items = read_plan(a.plan)
             b = Batch(s, a.parallel, a.per_server, a.max_cutovers, a.dry_run)
-            res = b.run(items, opts)
+            res = b.run(items, opts, canary=a.canary)
             bad = [r for r in res if r[2]]
             print(f"{len(res) - len(bad)} ok, {len(bad)} failed")
             for it, _, err in bad:
@@ -310,8 +345,12 @@ def main(argv=None) -> int:
                 return 0
             for j in jobs:
                 print(f"will purge mailbox {j.data.get('src_mailbox_id')} of {j.account} on {j.src}")
-            if not a.yes and (not sys.stdin.isatty() or input("proceed? [y/N] ").lower() != "y"):
-                return 1
+            if not a.yes:
+                for j in jobs:
+                    if not _confirm_purge(j):
+                        print(f"purge declined for {j.account}; aborting "
+                              f"(use --yes to skip confirmation)", file=sys.stderr)
+                        return 1
             for j in jobs:
                 eng.purge(j, keep_blobs=a.keep_blobs)
             return 0

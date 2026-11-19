@@ -1,0 +1,13 @@
+[Unit]
+Description=zmove garbage collection (drop staging schemas and blob dirs of failed/aborted jobs)
+Documentation=file:///opt/zmove/move-mailbox-steps.md
+# Run as the user that owns ~/.local/share/zmove/state.db (usually root).
+# Adjust User= and --config to match your install.
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/zmove gc --older-than 168 --prune-events 90
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
